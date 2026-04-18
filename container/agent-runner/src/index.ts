@@ -20,8 +20,18 @@ import { execFile } from 'child_process';
 import { query, HookCallback, PreCompactHookInput } from '@anthropic-ai/claude-agent-sdk';
 import { fileURLToPath } from 'url';
 
+interface ContentBlock {
+  type: string;
+  text?: string;
+  source?: {
+    type: 'base64';
+    media_type: string;
+    data: string;
+  };
+}
+
 interface ContainerInput {
-  prompt: string;
+  prompt: string | ContentBlock[];
   sessionId?: string;
   groupFolder: string;
   chatJid: string;
@@ -49,9 +59,11 @@ interface SessionsIndex {
   entries: SessionEntry[];
 }
 
+type MessageContent = string | ContentBlock[];
+
 interface SDKUserMessage {
   type: 'user';
-  message: { role: 'user'; content: string };
+  message: { role: 'user'; content: MessageContent };
   parent_tool_use_id: null;
   session_id: string;
 }
@@ -69,10 +81,10 @@ class MessageStream {
   private waiting: (() => void) | null = null;
   private done = false;
 
-  push(text: string): void {
+  push(content: MessageContent): void {
     this.queue.push({
       type: 'user',
-      message: { role: 'user', content: text },
+      message: { role: 'user', content },
       parent_tool_use_id: null,
       session_id: '',
     });
@@ -332,7 +344,7 @@ function waitForIpcMessage(): Promise<string | null> {
  * Also pipes IPC messages into the stream during the query.
  */
 async function runQuery(
-  prompt: string,
+  prompt: MessageContent,
   sessionId: string | undefined,
   mcpServerPath: string,
   containerInput: ContainerInput,
@@ -551,21 +563,27 @@ async function main(): Promise<void> {
   try { fs.unlinkSync(IPC_INPUT_CLOSE_SENTINEL); } catch { /* ignore */ }
 
   // Build initial prompt (drain any pending IPC messages too)
-  let prompt = containerInput.prompt;
-  if (containerInput.isScheduledTask) {
+  // Prompt can be a string or ContentBlock[] (multimodal with images)
+  let prompt: MessageContent = containerInput.prompt;
+  if (containerInput.isScheduledTask && typeof prompt === 'string') {
     prompt = `[SCHEDULED TASK - The following message was sent automatically and is not coming directly from the user or group.]\n\n${prompt}`;
   }
   const pending = drainIpcInput();
   if (pending.length > 0) {
     log(`Draining ${pending.length} pending IPC messages into initial prompt`);
-    prompt += '\n' + pending.join('\n');
+    if (typeof prompt === 'string') {
+      prompt += '\n' + pending.join('\n');
+    } else {
+      // For multimodal prompts, append IPC messages as additional text blocks
+      prompt = [...prompt, ...pending.map((t) => ({ type: 'text' as const, text: t }))];
+    }
   }
 
   // --- Slash command handling ---
   // Only known session slash commands are handled here. This prevents
   // accidental interception of user prompts that happen to start with '/'.
   const KNOWN_SESSION_COMMANDS = new Set(['/compact']);
-  const trimmedPrompt = prompt.trim();
+  const trimmedPrompt = typeof prompt === 'string' ? prompt.trim() : '';
   const isSessionSlashCommand = KNOWN_SESSION_COMMANDS.has(trimmedPrompt);
 
   if (isSessionSlashCommand) {

@@ -2,6 +2,17 @@ import { Channel, NewMessage } from './types.js';
 import { formatLocalTime } from './timezone.js';
 import { parseTextStyles, ChannelType } from './text-styles.js';
 
+export type ContentBlock = {
+  type: string;
+  text?: string;
+  source?: {
+    type: 'base64';
+    media_type: string;
+    data: string;
+  };
+  [key: string]: unknown;
+};
+
 export function escapeXml(s: string): string {
   if (!s) return '';
   return s
@@ -23,6 +34,40 @@ export function formatMessages(
   const header = `<context timezone="${escapeXml(timezone)}" />\n`;
 
   return `${header}<messages>\n${lines.join('\n')}\n</messages>`;
+}
+
+/**
+ * Build multimodal content blocks when messages contain images.
+ * Returns the XML text block followed by image blocks.
+ */
+export function formatMessagesMultimodal(
+  messages: NewMessage[],
+  timezone: string,
+): ContentBlock[] {
+  const blocks: ContentBlock[] = [
+    { type: 'text', text: formatMessages(messages, timezone) },
+  ];
+
+  for (const msg of messages) {
+    if (!msg.images?.length) continue;
+    for (const img of msg.images) {
+      blocks.push({
+        type: 'image',
+        source: {
+          type: 'base64',
+          media_type: img.mediaType,
+          data: img.data,
+        },
+      });
+    }
+  }
+
+  return blocks;
+}
+
+/** Returns true if any message in the batch contains images. */
+export function hasImages(messages: NewMessage[]): boolean {
+  return messages.some((m) => m.images && m.images.length > 0);
 }
 
 export function stripInternalTags(text: string): string {

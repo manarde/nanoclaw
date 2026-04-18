@@ -20,7 +20,6 @@ import {
 import { resolveGroupFolderPath, resolveGroupIpcPath } from './group-folder.js';
 import { logger } from './logger.js';
 import {
-  CONTAINER_HOST_GATEWAY,
   CONTAINER_RUNTIME_BIN,
   hostGatewayArgs,
   readonlyMountArgs,
@@ -35,7 +34,7 @@ const OUTPUT_START_MARKER = '---NANOCLAW_OUTPUT_START---';
 const OUTPUT_END_MARKER = '---NANOCLAW_OUTPUT_END---';
 
 export interface ContainerInput {
-  prompt: string;
+  prompt: string | Array<{ type: string; [key: string]: unknown }>;
   sessionId?: string;
   groupFolder: string;
   chatJid: string;
@@ -233,13 +232,10 @@ function buildContainerArgs(
   // Route API traffic through the credential proxy (containers never see real secrets)
   args.push(
     '-e',
-    `ANTHROPIC_BASE_URL=http://${CONTAINER_HOST_GATEWAY}:${CREDENTIAL_PROXY_PORT}`,
+    `ANTHROPIC_BASE_URL=http://host.docker.internal:${CREDENTIAL_PROXY_PORT}`,
   );
 
   // Mirror the host's auth method with a placeholder value.
-  // API key mode: SDK sends x-api-key, proxy replaces with real key.
-  // OAuth mode:   SDK exchanges placeholder token for temp API key,
-  //               proxy injects real OAuth token on that exchange request.
   const authMode = detectAuthMode();
   if (authMode === 'api-key') {
     args.push('-e', 'ANTHROPIC_API_KEY=placeholder');
@@ -256,14 +252,7 @@ function buildContainerArgs(
   const hostUid = process.getuid?.();
   const hostGid = process.getgid?.();
   if (hostUid != null && hostUid !== 0 && hostUid !== 1000) {
-    if (isMain) {
-      // Main containers start as root so the entrypoint can mount --bind
-      // to shadow .env. Privileges are dropped via setpriv in entrypoint.sh.
-      args.push('-e', `RUN_UID=${hostUid}`);
-      args.push('-e', `RUN_GID=${hostGid}`);
-    } else {
-      args.push('--user', `${hostUid}:${hostGid}`);
-    }
+    args.push('--user', `${hostUid}:${hostGid}`);
     args.push('-e', 'HOME=/home/node');
   }
 
@@ -532,7 +521,7 @@ export async function runContainerAgent(
         } else {
           logLines.push(
             `=== Input Summary ===`,
-            `Prompt length: ${input.prompt.length} chars`,
+            `Prompt length: ${typeof input.prompt === 'string' ? input.prompt.length : JSON.stringify(input.prompt).length} chars`,
             `Session ID: ${input.sessionId || 'new'}`,
             ``,
           );
@@ -558,7 +547,7 @@ export async function runContainerAgent(
       } else {
         logLines.push(
           `=== Input Summary ===`,
-          `Prompt length: ${input.prompt.length} chars`,
+          `Prompt length: ${typeof input.prompt === 'string' ? input.prompt.length : JSON.stringify(input.prompt).length} chars`,
           `Session ID: ${input.sessionId || 'new'}`,
           ``,
           `=== Mounts ===`,

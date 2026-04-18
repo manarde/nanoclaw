@@ -1,19 +1,18 @@
 import fs from 'fs';
 import path from 'path';
 
-import { OneCLI } from '@onecli-sh/sdk';
-
 import {
   ASSISTANT_NAME,
+  CREDENTIAL_PROXY_PORT,
   DEFAULT_TRIGGER,
   getTriggerPattern,
   GROUPS_DIR,
   IDLE_TIMEOUT,
   MAX_MESSAGES_PER_PROMPT,
-  ONECLI_URL,
   POLL_INTERVAL,
   TIMEZONE,
 } from './config.js';
+import { startCredentialProxy } from './credential-proxy.js';
 import './channels/index.js';
 import {
   getChannelFactory,
@@ -48,7 +47,13 @@ import {
 import { GroupQueue } from './group-queue.js';
 import { resolveGroupFolderPath } from './group-folder.js';
 import { startIpcWatcher } from './ipc.js';
-import { findChannel, formatMessages, formatOutbound } from './router.js';
+import {
+  findChannel,
+  formatMessages,
+  formatMessagesMultimodal,
+  formatOutbound,
+  hasImages,
+} from './router.js';
 import { ChannelType } from './text-styles.js';
 import {
   restoreRemoteControl,
@@ -61,7 +66,11 @@ import {
   loadSenderAllowlist,
   shouldDropMessage,
 } from './sender-allowlist.js';
-import { extractSessionCommand, handleSessionCommand, isSessionCommandAllowed } from './session-commands.js';
+import {
+  extractSessionCommand,
+  handleSessionCommand,
+  isSessionCommandAllowed,
+} from './session-commands.js';
 import { startSchedulerLoop } from './task-scheduler.js';
 import { Channel, NewMessage, RegisteredGroup } from './types.js';
 import { logger } from './logger.js';
@@ -78,26 +87,6 @@ let messageLoopRunning = false;
 const channels: Channel[] = [];
 const queue = new GroupQueue();
 
-const onecli = new OneCLI({ url: ONECLI_URL });
-
-function ensureOneCLIAgent(jid: string, group: RegisteredGroup): void {
-  if (group.isMain) return;
-  const identifier = group.folder.toLowerCase().replace(/_/g, '-');
-  onecli.ensureAgent({ name: group.name, identifier }).then(
-    (res) => {
-      logger.info(
-        { jid, identifier, created: res.created },
-        'OneCLI agent ensured',
-      );
-    },
-    (err) => {
-      logger.debug(
-        { jid, identifier, err: String(err) },
-        'OneCLI agent ensure skipped',
-      );
-    },
-  );
-}
 
 function loadState(): void {
   lastTimestamp = getRouterState('last_timestamp') || '';
@@ -180,9 +169,6 @@ function registerGroup(jid: string, group: RegisteredGroup): void {
     }
   }
 
-  // Ensure a corresponding OneCLI agent exists (best-effort, non-blocking)
-  ensureOneCLIAgent(jid, group);
-
   logger.info(
     { jid, name: group.name, folder: group.folder },
     'Group registered',
@@ -248,18 +234,28 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     timezone: TIMEZONE,
     deps: {
       sendMessage: (text) => channel.sendMessage(chatJid, text),
-      setTyping: (typing) => channel.setTyping?.(chatJid, typing) ?? Promise.resolve(),
-      runAgent: (prompt, onOutput) => runAgent(group, prompt, chatJid, onOutput),
+      setTyping: (typing) =>
+        channel.setTyping?.(chatJid, typing) ?? Promise.resolve(),
+      runAgent: (prompt, onOutput) =>
+        runAgent(group, prompt, chatJid, onOutput),
       closeStdin: () => queue.closeStdin(chatJid),
-      advanceCursor: (ts) => { lastAgentTimestamp[chatJid] = ts; saveState(); },
+      advanceCursor: (ts) => {
+        lastAgentTimestamp[chatJid] = ts;
+        saveState();
+      },
       formatMessages,
       canSenderInteract: (msg) => {
-        const hasTrigger = getTriggerPattern(group.trigger).test(msg.content.trim());
+        const hasTrigger = getTriggerPattern(group.trigger).test(
+          msg.content.trim(),
+        );
         const reqTrigger = !isMainGroup && group.requiresTrigger !== false;
-        return isMainGroup || !reqTrigger || (hasTrigger && (
-          msg.is_from_me ||
-          isTriggerAllowed(chatJid, msg.sender, loadSenderAllowlist())
-        ));
+        return (
+          isMainGroup ||
+          !reqTrigger ||
+          (hasTrigger &&
+            (msg.is_from_me ||
+              isTriggerAllowed(chatJid, msg.sender, loadSenderAllowlist())))
+        );
       },
     },
   });
@@ -280,7 +276,9 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     }
   }
 
-  const prompt = formatMessages(missedMessages, TIMEZONE);
+  const prompt = hasImages(missedMessages)
+    ? formatMessagesMultimodal(missedMessages, TIMEZONE)
+    : formatMessages(missedMessages, TIMEZONE);
 
   // Advance cursor so the piping path in startMessageLoop won't re-fetch
   // these messages. Save the old cursor so we can roll back on error.
@@ -367,7 +365,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
 
 async function runAgent(
   group: RegisteredGroup,
-  prompt: string,
+  prompt: string | Array<{ type: string; [key: string]: unknown }>,
   chatJid: string,
   onOutput?: (output: ContainerOutput) => Promise<void>,
 ): Promise<'success' | 'error'> {
@@ -498,14 +496,23 @@ async function startMessageLoop(): Promise<void> {
           // --- Session command interception (message loop) ---
           // Scan ALL messages in the batch for a session command.
           const loopCmdMsg = groupMessages.find(
-            (m) => extractSessionCommand(m.content, getTriggerPattern(group.trigger)) !== null,
+            (m) =>
+              extractSessionCommand(
+                m.content,
+                getTriggerPattern(group.trigger),
+              ) !== null,
           );
 
           if (loopCmdMsg) {
             // Only close active container if the sender is authorized — otherwise an
             // untrusted user could kill in-flight work by sending /compact (DoS).
             // closeStdin no-ops internally when no container is active.
-            if (isSessionCommandAllowed(isMainGroup, loopCmdMsg.is_from_me === true)) {
+            if (
+              isSessionCommandAllowed(
+                isMainGroup,
+                loopCmdMsg.is_from_me === true,
+              )
+            ) {
               queue.closeStdin(chatJid);
             }
             // Enqueue so processGroupMessages handles auth + cursor advancement.
@@ -601,15 +608,13 @@ function ensureContainerSystemRunning(): void {
 
 async function main(): Promise<void> {
   ensureContainerSystemRunning();
+
+  // Start credential proxy so containers can authenticate via the host
+  await startCredentialProxy(CREDENTIAL_PROXY_PORT, '0.0.0.0');
+
   initDatabase();
   logger.info('Database initialized');
   loadState();
-
-  // Ensure OneCLI agents exist for all registered groups.
-  // Recovers from missed creates (e.g. OneCLI was down at registration time).
-  for (const [jid, group] of Object.entries(registeredGroups)) {
-    ensureOneCLIAgent(jid, group);
-  }
 
   restoreRemoteControl();
 

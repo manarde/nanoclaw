@@ -15,6 +15,8 @@ import {
   GROUPS_DIR,
   IDLE_TIMEOUT,
   OLLAMA_ADMIN_TOOLS,
+  ONECLI_API_KEY,
+  ONECLI_URL,
   TIMEZONE,
 } from './config.js';
 import { resolveGroupFolderPath, resolveGroupIpcPath } from './group-folder.js';
@@ -67,7 +69,7 @@ function buildVolumeMounts(
 
   if (isMain) {
     // Main gets the project root read-only. Writable paths the agent needs
-    // (group folder, IPC, .claude/) are mounted separately below.
+    // (store, group folder, IPC, .claude/) are mounted separately below.
     // Read-only prevents the agent from modifying host application code
     // (src/, dist/, package.json, etc.) which would bypass the sandbox
     // entirely on next restart.
@@ -80,12 +82,31 @@ function buildVolumeMounts(
     // .env shadowing is handled inside the container entrypoint via mount --bind
     // (Apple Container only supports directory mounts, not file mounts like /dev/null)
 
+    // Main gets writable access to the store (SQLite DB) so it can
+    // query and write to the database directly.
+    const storeDir = path.join(projectRoot, 'store');
+    mounts.push({
+      hostPath: storeDir,
+      containerPath: '/workspace/project/store',
+      readonly: false,
+    });
+
     // Main also gets its group folder as the working directory
     mounts.push({
       hostPath: groupDir,
       containerPath: '/workspace/group',
       readonly: false,
     });
+
+    // Global memory directory — writable for main so it can update shared context
+    const globalDir = path.join(GROUPS_DIR, 'global');
+    if (fs.existsSync(globalDir)) {
+      mounts.push({
+        hostPath: globalDir,
+        containerPath: '/workspace/global',
+        readonly: false,
+      });
+    }
   } else {
     // Other groups only get their own folder
     mounts.push({
@@ -387,12 +408,7 @@ export async function runContainerAgent(
       const chunk = data.toString();
       const lines = chunk.trim().split('\n');
       for (const line of lines) {
-        if (!line) continue;
-        if (line.includes('[OLLAMA]')) {
-          logger.info({ container: group.folder }, line);
-        } else {
-          logger.debug({ container: group.folder }, line);
-        }
+        if (line) logger.debug({ container: group.folder }, line);
       }
       // Don't reset timeout on stderr — SDK writes debug logs continuously.
       // Timeout only resets on actual output (OUTPUT_MARKER in stdout).

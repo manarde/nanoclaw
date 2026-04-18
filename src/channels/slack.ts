@@ -91,8 +91,13 @@ export class SlackChannel implements Channel {
     // Catch-all: log any event type we're not explicitly handling
     // to discover how Slack delivers file uploads
     this.app.use(async ({ body, next }) => {
-      const b = body as { event?: { type?: string; subtype?: string; files?: unknown[] } };
-      if (b.event && (b.event.files || (b.event.type && b.event.type !== 'message'))) {
+      const b = body as {
+        event?: { type?: string; subtype?: string; files?: unknown[] };
+      };
+      if (
+        b.event &&
+        (b.event.files || (b.event.type && b.event.type !== 'message'))
+      ) {
         logger.info(
           {
             eventType: b.event.type,
@@ -239,7 +244,10 @@ export class SlackChannel implements Channel {
           'Downloaded Slack image',
         );
       } catch (err) {
-        logger.warn({ fileName: file.name, err }, 'Error downloading Slack image');
+        logger.warn(
+          { fileName: file.name, err },
+          'Error downloading Slack image',
+        );
       }
     }
     return images;

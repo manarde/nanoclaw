@@ -1,5 +1,6 @@
 import https from 'https';
 import { Api, Bot } from 'grammy';
+import sharp from 'sharp';
 
 import { ASSISTANT_NAME, TRIGGER_PATTERN } from '../config.js';
 import { readEnvFile } from '../env.js';
@@ -7,10 +8,13 @@ import { logger } from '../logger.js';
 import { registerChannel, ChannelOpts } from './registry.js';
 import {
   Channel,
+  MessageImage,
   OnChatMetadata,
   OnInboundMessage,
   RegisteredGroup,
 } from '../types.js';
+
+const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
 
 export interface TelegramChannelOpts {
   onMessage: OnInboundMessage;
@@ -199,7 +203,51 @@ export class TelegramChannel implements Channel {
       });
     };
 
-    this.bot.on('message:photo', (ctx) => storeNonText(ctx, '[Photo]'));
+    this.bot.on('message:photo', async (ctx) => {
+      const chatJid = `tg:${ctx.chat.id}`;
+      const group = this.opts.registeredGroups()[chatJid];
+      if (!group) return;
+
+      const timestamp = new Date(ctx.message.date * 1000).toISOString();
+      const senderName =
+        ctx.from?.first_name ||
+        ctx.from?.username ||
+        ctx.from?.id?.toString() ||
+        'Unknown';
+      const caption = ctx.message.caption || '';
+
+      const isGroup =
+        ctx.chat.type === 'group' || ctx.chat.type === 'supergroup';
+      this.opts.onChatMetadata(
+        chatJid,
+        timestamp,
+        undefined,
+        'telegram',
+        isGroup,
+      );
+
+      // Telegram delivers multiple sizes; take the largest that's under our cap.
+      const sizes = [...(ctx.message.photo || [])].sort(
+        (a, b) => (b.file_size || 0) - (a.file_size || 0),
+      );
+      const chosen = sizes.find(
+        (s) => !s.file_size || s.file_size <= MAX_IMAGE_BYTES,
+      );
+      const image = chosen
+        ? await this.downloadTelegramImage(chosen.file_id)
+        : undefined;
+
+      this.opts.onMessage(chatJid, {
+        id: ctx.message.message_id.toString(),
+        chat_jid: chatJid,
+        sender: ctx.from?.id?.toString() || '',
+        sender_name: senderName,
+        content: caption || '[Photo]',
+        timestamp,
+        is_from_me: false,
+        images: image ? [image] : undefined,
+      });
+    });
     this.bot.on('message:video', (ctx) => storeNonText(ctx, '[Video]'));
     this.bot.on('message:voice', (ctx) => storeNonText(ctx, '[Voice message]'));
     this.bot.on('message:audio', (ctx) => storeNonText(ctx, '[Audio]'));
@@ -288,6 +336,56 @@ export class TelegramChannel implements Channel {
       await this.bot.api.sendChatAction(numericId, 'typing');
     } catch (err) {
       logger.debug({ jid, err }, 'Failed to send Telegram typing indicator');
+    }
+  }
+
+  private async downloadTelegramImage(
+    fileId: string,
+  ): Promise<MessageImage | undefined> {
+    if (!this.bot) return undefined;
+    try {
+      const file = await this.bot.api.getFile(fileId);
+      if (!file.file_path) return undefined;
+      const url = `https://api.telegram.org/file/bot${this.botToken}/${file.file_path}`;
+      const resp = await fetch(url);
+      if (!resp.ok) {
+        logger.warn(
+          { fileId, status: resp.status },
+          'Failed to download Telegram image',
+        );
+        return undefined;
+      }
+      const contentType = resp.headers.get('content-type') || '';
+      if (!contentType.startsWith('image/')) {
+        logger.warn(
+          { fileId, contentType },
+          'Telegram image download returned non-image content',
+        );
+        return undefined;
+      }
+      const buffer = Buffer.from(await resp.arrayBuffer());
+      if (buffer.length > MAX_IMAGE_BYTES) return undefined;
+      // Resize to stay within Claude's 3.75MP sweet spot.
+      const processed = await sharp(buffer)
+        .resize({
+          width: 1568,
+          height: 1568,
+          fit: 'inside',
+          withoutEnlargement: true,
+        })
+        .jpeg({ quality: 85 })
+        .toBuffer();
+      logger.debug(
+        { fileId, origSize: buffer.length, outSize: processed.length },
+        'Downloaded Telegram image',
+      );
+      return {
+        mediaType: 'image/jpeg',
+        data: processed.toString('base64'),
+      };
+    } catch (err) {
+      logger.warn({ fileId, err }, 'Error downloading Telegram image');
+      return undefined;
     }
   }
 }

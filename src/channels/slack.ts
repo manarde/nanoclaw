@@ -1,5 +1,6 @@
 import { App, LogLevel } from '@slack/bolt';
 import type { GenericMessageEvent, BotMessageEvent } from '@slack/types';
+import sharp from 'sharp';
 
 import { ASSISTANT_NAME, TRIGGER_PATTERN } from '../config.js';
 import { updateChatName } from '../db.js';
@@ -233,14 +234,44 @@ export class SlackChannel implements Channel {
           );
           continue;
         }
+        // Slack returns 200 OK with an HTML sign-in page when the bot token
+        // lacks `files:read` scope. Without this guard, that HTML gets sent
+        // to the model as "image/jpeg" and the API rejects the whole request.
+        const contentType = resp.headers.get('content-type') || '';
+        if (!contentType.startsWith('image/')) {
+          logger.warn(
+            { fileName: file.name, contentType, status: resp.status },
+            'Slack image download returned non-image content (check bot has files:read scope)',
+          );
+          continue;
+        }
         const buffer = Buffer.from(await resp.arrayBuffer());
         if (buffer.length > MAX_IMAGE_BYTES) continue;
+        // Resize to stay under Claude's 3.75 megapixel recommendation while
+        // preserving aspect ratio. Animated GIFs are passed through as-is.
+        const isAnimated = file.mimetype === 'image/gif';
+        const processed = isAnimated
+          ? buffer
+          : await sharp(buffer)
+              .resize({
+                width: 1568,
+                height: 1568,
+                fit: 'inside',
+                withoutEnlargement: true,
+              })
+              .jpeg({ quality: 85 })
+              .toBuffer();
+        const mediaType = isAnimated ? file.mimetype : 'image/jpeg';
         images.push({
-          mediaType: file.mimetype,
-          data: buffer.toString('base64'),
+          mediaType,
+          data: processed.toString('base64'),
         });
         logger.debug(
-          { fileName: file.name, size: buffer.length },
+          {
+            fileName: file.name,
+            origSize: buffer.length,
+            outSize: processed.length,
+          },
           'Downloaded Slack image',
         );
       } catch (err) {

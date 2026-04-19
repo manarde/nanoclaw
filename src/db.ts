@@ -32,6 +32,7 @@ function createSchema(database: Database.Database): void {
       timestamp TEXT,
       is_from_me INTEGER,
       is_bot_message INTEGER DEFAULT 0,
+      images TEXT,
       PRIMARY KEY (id, chat_jid),
       FOREIGN KEY (chat_jid) REFERENCES chats(jid)
     );
@@ -156,6 +157,15 @@ function createSchema(database: Database.Database): void {
     database.exec(`ALTER TABLE messages ADD COLUMN reply_to_sender_name TEXT`);
   } catch {
     /* columns already exist */
+  }
+
+  // Add images column if it doesn't exist (migration for existing DBs).
+  // Stores JSON-serialized MessageImage[] so channels with image attachments
+  // (Slack, WhatsApp) can deliver multimodal content to the agent.
+  try {
+    database.exec(`ALTER TABLE messages ADD COLUMN images TEXT`);
+  } catch {
+    /* column already exists */
   }
 }
 
@@ -285,7 +295,7 @@ export function setLastGroupSync(): void {
  */
 export function storeMessage(msg: NewMessage): void {
   db.prepare(
-    `INSERT OR REPLACE INTO messages (id, chat_jid, sender, sender_name, content, timestamp, is_from_me, is_bot_message, reply_to_message_id, reply_to_message_content, reply_to_sender_name) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT OR REPLACE INTO messages (id, chat_jid, sender, sender_name, content, timestamp, is_from_me, is_bot_message, reply_to_message_id, reply_to_message_content, reply_to_sender_name, images) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
     msg.id,
     msg.chat_jid,
@@ -298,6 +308,7 @@ export function storeMessage(msg: NewMessage): void {
     msg.reply_to_message_id ?? null,
     msg.reply_to_message_content ?? null,
     msg.reply_to_sender_name ?? null,
+    msg.images?.length ? JSON.stringify(msg.images) : null,
   );
 }
 
@@ -377,7 +388,8 @@ export function getMessagesSince(
   const sql = `
     SELECT * FROM (
       SELECT id, chat_jid, sender, sender_name, content, timestamp, is_from_me,
-             reply_to_message_id, reply_to_message_content, reply_to_sender_name
+             reply_to_message_id, reply_to_message_content, reply_to_sender_name,
+             images
       FROM messages
       WHERE chat_jid = ? AND timestamp > ?
         AND is_bot_message = 0 AND content NOT LIKE ?
@@ -386,9 +398,18 @@ export function getMessagesSince(
       LIMIT ?
     ) ORDER BY timestamp
   `;
-  return db
+  const rows = db
     .prepare(sql)
-    .all(chatJid, sinceTimestamp, `${botPrefix}:%`, limit) as NewMessage[];
+    .all(chatJid, sinceTimestamp, `${botPrefix}:%`, limit) as (NewMessage & {
+    images?: string | null;
+  })[];
+  return rows.map((row) => ({
+    ...row,
+    images:
+      typeof row.images === 'string' && row.images
+        ? JSON.parse(row.images)
+        : undefined,
+  }));
 }
 
 export function getLastBotMessageTimestamp(

@@ -73,6 +73,34 @@ Standard Markdown: `**bold**`, `*italic*`, `[links](url)`, `# headings`.
 
 ---
 
+## Wiki Knowledge Base
+
+You maintain a persistent wiki — a compounding knowledge base that grows with every source ingested. This is NOT RAG. You build and maintain structured, interlinked pages rather than re-deriving answers each time.
+
+The wiki lives at `/workspace/global/` and is shared across all channels (main, Slack, Telegram). Any channel can read and write it. Concurrent updates to `index.md` / `log.md` are not coordinated — assume you might race with another channel's agent, keep edits short.
+
+### Three Layers
+- **`/workspace/global/sources/`** — Raw immutable files (articles, PDFs, images). You add files but don't modify existing ones.
+- **`/workspace/global/wiki/`** — Your maintained pages: summaries, entities, concepts, comparisons. You own this.
+- **`container/skills/wiki/SKILL.md`** — Full workflow reference. Read it for detailed ingest/query/lint procedures.
+
+### Key Files
+- `/workspace/global/wiki/index.md` — Read this FIRST when answering queries. Catalog of all pages.
+- `/workspace/global/wiki/log.md` — Append-only activity log. Format: `## [YYYY-MM-DD] action | Subject`
+
+### Operations
+- **Ingest**: User provides a source. Save to `/workspace/global/sources/`, read thoroughly, discuss takeaways, then create/update all wiki pages (summary, entities, concepts, cross-references, index, log).
+- **Query**: Read index, find relevant pages, synthesize answer with citations.
+- **Lint**: Health-check for contradictions, orphans, stale content, gaps.
+
+### Critical Rule
+**Process sources ONE AT A TIME.** When given multiple files, complete each fully (read, discuss, update all pages, index, log) before starting the next. Never batch-read then batch-process.
+
+### Source Handling
+- URLs: Download full content with `curl -sLo /workspace/global/sources/filename.ext "<url>"`. Do NOT use WebFetch for wiki ingestion — it returns summaries, not full text. Use `agent-browser` for web pages that need rendering.
+- PDFs: Use the pdf-reader skill if available, or `pdftotext`
+- Images: Use image vision if available
+
 ## Admin Context
 
 This is the **main channel**, which has elevated privileges.

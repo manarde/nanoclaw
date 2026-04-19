@@ -116,14 +116,16 @@ function buildVolumeMounts(
       readonly: false,
     });
 
-    // Global memory directory (read-only for non-main)
-    // Only directory mounts are supported, not file mounts
+    // Global memory directory — writable for all groups so the shared wiki
+    // can be maintained from any channel (no main-as-curator bottleneck).
+    // Tradeoff: no cross-channel write coordination, so concurrent updates
+    // to wiki/index.md or wiki/log.md can interleave.
     const globalDir = path.join(GROUPS_DIR, 'global');
     if (fs.existsSync(globalDir)) {
       mounts.push({
         hostPath: globalDir,
         containerPath: '/workspace/global',
-        readonly: true,
+        readonly: false,
       });
     }
   }

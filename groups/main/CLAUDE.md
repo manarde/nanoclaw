@@ -102,6 +102,10 @@ The wiki lives at `/workspace/global/` and is shared across all channels (main, 
 - Images: Use image vision if available
 - Inbound file uploads: land in `/workspace/group/incoming/`. The message content will include `[Attached file: incoming/<name>]`. When ingesting into the wiki, move the file from `incoming/` to `/workspace/global/sources/` before building the summary.
 
+## MCP Servers
+
+Shared MCP servers are defined in `/workspace/global/.mcp.json` and loaded for every channel. Per-channel MCP servers can still go in `.mcp.json` at the channel's group folder (auto-loaded by the SDK from the working directory). The built-in `nanoclaw` server (for `send_message` etc.) is always present.
+
 ## Admin Context
 
 This is the **main channel**, which has elevated privileges.

@@ -431,6 +431,25 @@ async function runQuery(
     globalClaudeMd = fs.readFileSync(globalClaudeMdPath, 'utf-8');
   }
 
+  // Load shared MCP servers from /workspace/global/.mcp.json so a single file
+  // can publish MCP servers to every channel. The built-in `nanoclaw` server
+  // (IPC) is always added last, so users cannot shadow it from global.
+  const globalMcpPath = '/workspace/global/.mcp.json';
+  const globalMcpServers: Record<string, unknown> = {};
+  if (fs.existsSync(globalMcpPath)) {
+    try {
+      const raw = fs.readFileSync(globalMcpPath, 'utf-8');
+      const parsed = JSON.parse(raw) as {
+        mcpServers?: Record<string, unknown>;
+      };
+      if (parsed?.mcpServers && typeof parsed.mcpServers === 'object') {
+        Object.assign(globalMcpServers, parsed.mcpServers);
+      }
+    } catch (err) {
+      log(`Failed to parse /workspace/global/.mcp.json: ${err}`);
+    }
+  }
+
   // Discover additional directories mounted at /workspace/extra/*
   // These are passed to the SDK so their CLAUDE.md files are loaded automatically
   const extraDirs: string[] = [];
@@ -487,6 +506,7 @@ async function runQuery(
       allowDangerouslySkipPermissions: true,
       settingSources: ['project', 'user'],
       mcpServers: {
+        ...globalMcpServers,
         nanoclaw: {
           command: 'node',
           args: [mcpServerPath],

@@ -40,6 +40,10 @@ Files you create are saved in `/workspace/group/`. Use this for notes, research,
 
 Inbound file attachments (PDFs, docs, text, etc. — not images) land in `/workspace/group/incoming/`. When the message content includes `[Attached file: incoming/<name>]`, read that file before responding. Use `pdftotext <path> -` for PDFs, or the Read tool for text formats. If the user wants the file ingested into the wiki, move it from `incoming/` to `/workspace/global/sources/` as part of the ingest step.
 
+## MCP Servers
+
+Shared MCP servers are defined in `/workspace/global/.mcp.json` and loaded for every channel. Per-channel MCP servers can still go in `.mcp.json` at the channel's group folder (auto-loaded by the SDK from the working directory). The built-in `nanoclaw` server (for `send_message` etc.) is always present.
+
 ## Memory
 
 The `conversations/` folder contains searchable history of past conversations. Use this to recall context from previous sessions.

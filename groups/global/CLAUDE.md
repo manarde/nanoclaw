@@ -38,6 +38,8 @@ When working as a sub-agent or teammate, only use `send_message` if instructed t
 
 Files you create are saved in `/workspace/group/`. Use this for notes, research, or anything that should persist.
 
+Inbound file attachments (PDFs, docs, text, etc. — not images) land in `/workspace/group/incoming/`. When the message content includes `[Attached file: incoming/<name>]`, read that file before responding. Use `pdftotext <path> -` for PDFs, or the Read tool for text formats. If the user wants the file ingested into the wiki, move it from `incoming/` to `/workspace/global/sources/` as part of the ingest step.
+
 ## Memory
 
 The `conversations/` folder contains searchable history of past conversations. Use this to recall context from previous sessions.

@@ -100,6 +100,7 @@ The wiki lives at `/workspace/global/` and is shared across all channels (main, 
 - URLs: Download full content with `curl -sLo /workspace/global/sources/filename.ext "<url>"`. Do NOT use WebFetch for wiki ingestion — it returns summaries, not full text. Use `agent-browser` for web pages that need rendering.
 - PDFs: Use the pdf-reader skill if available, or `pdftotext`
 - Images: Use image vision if available
+- Inbound file uploads: land in `/workspace/group/incoming/`. The message content will include `[Attached file: incoming/<name>]`. When ingesting into the wiki, move the file from `incoming/` to `/workspace/global/sources/` before building the summary.
 
 ## Admin Context
 

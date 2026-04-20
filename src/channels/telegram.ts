@@ -5,6 +5,7 @@ import sharp from 'sharp';
 import { ASSISTANT_NAME, TRIGGER_PATTERN } from '../config.js';
 import { readEnvFile } from '../env.js';
 import { logger } from '../logger.js';
+import { saveAttachment } from './attachment-store.js';
 import { registerChannel, ChannelOpts } from './registry.js';
 import {
   Channel,
@@ -251,9 +252,49 @@ export class TelegramChannel implements Channel {
     this.bot.on('message:video', (ctx) => storeNonText(ctx, '[Video]'));
     this.bot.on('message:voice', (ctx) => storeNonText(ctx, '[Voice message]'));
     this.bot.on('message:audio', (ctx) => storeNonText(ctx, '[Audio]'));
-    this.bot.on('message:document', (ctx) => {
+    this.bot.on('message:document', async (ctx) => {
+      const chatJid = `tg:${ctx.chat.id}`;
+      const group = this.opts.registeredGroups()[chatJid];
+      if (!group) return;
+
+      const timestamp = new Date(ctx.message.date * 1000).toISOString();
+      const senderName =
+        ctx.from?.first_name ||
+        ctx.from?.username ||
+        ctx.from?.id?.toString() ||
+        'Unknown';
+      const caption = ctx.message.caption || '';
       const name = ctx.message.document?.file_name || 'file';
-      storeNonText(ctx, `[Document: ${name}]`);
+
+      const isGroup =
+        ctx.chat.type === 'group' || ctx.chat.type === 'supergroup';
+      this.opts.onChatMetadata(
+        chatJid,
+        timestamp,
+        undefined,
+        'telegram',
+        isGroup,
+      );
+
+      const fileId = ctx.message.document?.file_id;
+      const saved = fileId
+        ? await this.downloadTelegramDocument(fileId, name, group.folder)
+        : undefined;
+
+      const ref = saved
+        ? `[Attached file: ${saved.relativePath}]`
+        : `[Document: ${name}]`;
+      const content = caption ? `${caption}\n${ref}` : ref;
+
+      this.opts.onMessage(chatJid, {
+        id: ctx.message.message_id.toString(),
+        chat_jid: chatJid,
+        sender: ctx.from?.id?.toString() || '',
+        sender_name: senderName,
+        content,
+        timestamp,
+        is_from_me: false,
+      });
     });
     this.bot.on('message:sticker', (ctx) => {
       const emoji = ctx.message.sticker?.emoji || '';
@@ -385,6 +426,44 @@ export class TelegramChannel implements Channel {
       };
     } catch (err) {
       logger.warn({ fileId, err }, 'Error downloading Telegram image');
+      return undefined;
+    }
+  }
+
+  private async downloadTelegramDocument(
+    fileId: string,
+    originalName: string,
+    groupFolder: string,
+  ): Promise<{ relativePath: string } | undefined> {
+    if (!this.bot) return undefined;
+    try {
+      const file = await this.bot.api.getFile(fileId);
+      if (!file.file_path) return undefined;
+      const url = `https://api.telegram.org/file/bot${this.botToken}/${file.file_path}`;
+      const resp = await fetch(url);
+      if (!resp.ok) {
+        logger.warn(
+          { fileId, status: resp.status },
+          'Failed to download Telegram document',
+        );
+        return undefined;
+      }
+      const buffer = Buffer.from(await resp.arrayBuffer());
+      const saved = await saveAttachment(groupFolder, originalName, buffer);
+      if (saved) {
+        logger.info(
+          {
+            fileId,
+            fileName: originalName,
+            path: saved.relativePath,
+            bytes: saved.bytes,
+          },
+          'Stored Telegram document',
+        );
+      }
+      return saved;
+    } catch (err) {
+      logger.warn({ fileId, err }, 'Error downloading Telegram document');
       return undefined;
     }
   }

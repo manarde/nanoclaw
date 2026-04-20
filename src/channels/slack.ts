@@ -6,6 +6,7 @@ import { ASSISTANT_NAME, TRIGGER_PATTERN } from '../config.js';
 import { updateChatName } from '../db.js';
 import { readEnvFile } from '../env.js';
 import { logger } from '../logger.js';
+import { saveAttachment } from './attachment-store.js';
 import { registerChannel, ChannelOpts } from './registry.js';
 import {
   Channel,
@@ -142,9 +143,12 @@ export class SlackChannel implements Channel {
       const hasImages = files?.some(
         (f) => f.mimetype && IMAGE_MIME_TYPES.has(f.mimetype),
       );
+      const hasOtherFiles = files?.some(
+        (f) => f.mimetype && !IMAGE_MIME_TYPES.has(f.mimetype),
+      );
 
-      // Allow through if there's text OR images
-      if (!msg.text && !hasImages) return;
+      // Allow through if there's text, images, or other attachments
+      if (!msg.text && !hasImages && !hasOtherFiles) return;
 
       // Threaded replies are flattened into the channel conversation.
       // The agent sees them alongside channel-level messages; responses
@@ -193,6 +197,21 @@ export class SlackChannel implements Channel {
         images = await this.downloadImages(files!);
         if (images.length > 0 && !content) {
           content = '[image]';
+        }
+      }
+
+      // Download non-image attachments (PDFs, text, CSVs, etc.) to the
+      // group's incoming/ folder. The agent reads them via pdftotext / Read.
+      if (hasOtherFiles && !isBotMessage && files) {
+        const refs = await this.downloadOtherAttachments(
+          files,
+          groups[jid].folder,
+        );
+        if (refs.length > 0) {
+          const attachLines = refs
+            .map((r) => `[Attached file: ${r}]`)
+            .join('\n');
+          content = content ? `${content}\n${attachLines}` : attachLines;
         }
       }
 
@@ -282,6 +301,62 @@ export class SlackChannel implements Channel {
       }
     }
     return images;
+  }
+
+  private async downloadOtherAttachments(
+    files: SlackFile[],
+    groupFolder: string,
+  ): Promise<string[]> {
+    const refs: string[] = [];
+    for (const file of files) {
+      if (!file.mimetype || IMAGE_MIME_TYPES.has(file.mimetype)) continue;
+      if (!file.url_private) continue;
+      try {
+        const resp = await fetch(file.url_private, {
+          headers: { Authorization: `Bearer ${this.botToken}` },
+        });
+        if (!resp.ok) {
+          logger.warn(
+            { fileName: file.name, status: resp.status },
+            'Failed to download Slack attachment',
+          );
+          continue;
+        }
+        // Same sign-in-HTML trap as images: verify Slack actually returned
+        // the file content rather than an auth redirect.
+        const contentType = resp.headers.get('content-type') || '';
+        if (contentType.startsWith('text/html')) {
+          logger.warn(
+            { fileName: file.name, contentType },
+            'Slack attachment download returned HTML (likely missing files:read scope)',
+          );
+          continue;
+        }
+        const buffer = Buffer.from(await resp.arrayBuffer());
+        const saved = await saveAttachment(
+          groupFolder,
+          file.name || 'attachment',
+          buffer,
+        );
+        if (saved) {
+          logger.info(
+            {
+              fileName: file.name,
+              path: saved.relativePath,
+              bytes: saved.bytes,
+            },
+            'Stored Slack attachment',
+          );
+          refs.push(saved.relativePath);
+        }
+      } catch (err) {
+        logger.warn(
+          { fileName: file.name, err },
+          'Error downloading Slack attachment',
+        );
+      }
+    }
+    return refs;
   }
 
   async connect(): Promise<void> {

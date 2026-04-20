@@ -1,0 +1,34 @@
+#!/bin/bash
+# PDF reader CLI for container agents
+# Usage: pdf-reader <command> [args]
+#   pdf-reader extract <file.pdf>      - Extract text to stdout
+#   pdf-reader info <file.pdf>          - Show PDF metadata
+#   pdf-reader fetch <url> [output]     - Download and extract
+
+set -euo pipefail
+
+cmd="${1:-help}"
+shift || true
+
+case "$cmd" in
+  extract)
+    file="${1:?Usage: pdf-reader extract <file.pdf>}"
+    pdftotext "$file" -
+    ;;
+  info)
+    file="${1:?Usage: pdf-reader info <file.pdf>}"
+    pdfinfo "$file"
+    ;;
+  fetch)
+    url="${1:?Usage: pdf-reader fetch <url> [output.pdf]}"
+    output="${2:-/tmp/fetched.pdf}"
+    curl -sLo "$output" "$url"
+    pdftotext "$output" -
+    ;;
+  help|*)
+    echo "Usage: pdf-reader <extract|info|fetch> [args]"
+    echo "  extract <file.pdf>      Extract text to stdout"
+    echo "  info <file.pdf>         Show PDF metadata"
+    echo "  fetch <url> [output]    Download and extract"
+    ;;
+esac

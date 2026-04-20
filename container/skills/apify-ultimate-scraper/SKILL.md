@@ -10,8 +10,8 @@ AI-driven data extraction from 55+ Actors across all major platforms. This skill
 ## Prerequisites
 (No need to check it upfront)
 
-- `.env` file with `APIFY_TOKEN`
-- Node.js 20.6+ (for native `--env-file` support)
+- `APIFY_TOKEN` in the environment (NanoClaw forwards it into the container from `.env` — no action needed; do not ask the user for it)
+- Node.js 20.6+
 
 ## Workflow
 
@@ -158,7 +158,7 @@ Replace `SEARCH_KEYWORDS` with 1-3 simple terms (e.g., "LinkedIn profiles", "Ama
 Fetch the Actor's input schema and details:
 
 ```bash
-node --env-file=.env ${CLAUDE_PLUGIN_ROOT}/reference/scripts/fetch_actor_details.js --actor "ACTOR_ID"
+node ${CLAUDE_PLUGIN_ROOT}/reference/scripts/fetch_actor_details.js --actor "ACTOR_ID"
 ```
 
 Replace `ACTOR_ID` with the selected Actor (e.g., `compass/crawler-google-places`).
@@ -185,14 +185,14 @@ For larger scraping tasks, ask:
 
 **Quick answer (display in chat, no file):**
 ```bash
-node --env-file=.env ${CLAUDE_PLUGIN_ROOT}/reference/scripts/run_actor.js \
+node ${CLAUDE_PLUGIN_ROOT}/reference/scripts/run_actor.js \
   --actor "ACTOR_ID" \
   --input 'JSON_INPUT'
 ```
 
 **CSV:**
 ```bash
-node --env-file=.env ${CLAUDE_PLUGIN_ROOT}/reference/scripts/run_actor.js \
+node ${CLAUDE_PLUGIN_ROOT}/reference/scripts/run_actor.js \
   --actor "ACTOR_ID" \
   --input 'JSON_INPUT' \
   --output YYYY-MM-DD_OUTPUT_FILE.csv \
@@ -201,7 +201,7 @@ node --env-file=.env ${CLAUDE_PLUGIN_ROOT}/reference/scripts/run_actor.js \
 
 **JSON:**
 ```bash
-node --env-file=.env ${CLAUDE_PLUGIN_ROOT}/reference/scripts/run_actor.js \
+node ${CLAUDE_PLUGIN_ROOT}/reference/scripts/run_actor.js \
   --actor "ACTOR_ID" \
   --input 'JSON_INPUT' \
   --output YYYY-MM-DD_OUTPUT_FILE.json \
@@ -226,7 +226,7 @@ After completion, report:
 
 ## Error Handling
 
-`APIFY_TOKEN not found` - Ask user to create `.env` with `APIFY_TOKEN=your_token`
+`APIFY_TOKEN not found` - NanoClaw didn't forward the token. Ask the user to put `APIFY_TOKEN=...` in the host `.env` and restart the service (the token is then forwarded into the container env on next spawn).
 `Actor not found` - Check Actor ID spelling
 `Run FAILED` - Ask user to check Apify console link in error output
 `Timeout` - Reduce input size or increase `--timeout`

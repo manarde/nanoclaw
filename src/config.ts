@@ -12,6 +12,7 @@ const envConfig = readEnvFile([
   'ONECLI_URL',
   'ONECLI_API_KEY',
   'TZ',
+  'APIFY_TOKEN',
 ]);
 
 export const ASSISTANT_NAME =
@@ -63,6 +64,11 @@ export const ONECLI_URL =
   process.env.ONECLI_URL || envConfig.ONECLI_URL || 'http://localhost:10254';
 export const ONECLI_API_KEY =
   process.env.ONECLI_API_KEY || envConfig.ONECLI_API_KEY;
+// Apify CLI reads APIFY_TOKEN from its environment; the container-skill set
+// under container/skills/apify-* shells out to `apify`, so we forward the
+// token when present. OneCLI's header-injection path can't cover CLI tools.
+export const APIFY_TOKEN =
+  process.env.APIFY_TOKEN || envConfig.APIFY_TOKEN;
 export const MAX_MESSAGES_PER_PROMPT = Math.max(
   1,
   parseInt(process.env.MAX_MESSAGES_PER_PROMPT || '10', 10) || 10,

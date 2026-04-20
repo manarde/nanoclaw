@@ -7,6 +7,7 @@ import fs from 'fs';
 import path from 'path';
 
 import {
+  APIFY_TOKEN,
   CONTAINER_IMAGE,
   CONTAINER_MAX_OUTPUT_SIZE,
   CONTAINER_TIMEOUT,
@@ -251,6 +252,13 @@ async function buildContainerArgs(
   // Forward Ollama admin tools flag if enabled
   if (OLLAMA_ADMIN_TOOLS) {
     args.push('-e', 'OLLAMA_ADMIN_TOOLS=true');
+  }
+
+  // Forward Apify token so the `apify` CLI (used by container/skills/apify-*)
+  // can authenticate. OneCLI can't inject this because it's a CLI env var,
+  // not an HTTPS header.
+  if (APIFY_TOKEN) {
+    args.push('-e', `APIFY_TOKEN=${APIFY_TOKEN}`);
   }
 
   // OneCLI gateway handles credential injection — containers never see real secrets.

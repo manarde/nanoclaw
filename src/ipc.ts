@@ -6,12 +6,20 @@ import { CronExpressionParser } from 'cron-parser';
 import { DATA_DIR, IPC_POLL_INTERVAL, TIMEZONE } from './config.js';
 import { AvailableGroup } from './container-runner.js';
 import { createTask, deleteTask, getTaskById, updateTask } from './db.js';
-import { isValidGroupFolder } from './group-folder.js';
+import {
+  isValidGroupFolder,
+  resolveGroupFolderPath,
+} from './group-folder.js';
 import { logger } from './logger.js';
-import { RegisteredGroup } from './types.js';
+import { RegisteredGroup, SendFileOpts } from './types.js';
 
 export interface IpcDeps {
   sendMessage: (jid: string, text: string) => Promise<void>;
+  sendFile: (
+    jid: string,
+    filePath: string,
+    opts?: SendFileOpts,
+  ) => Promise<void>;
   registeredGroups: () => Record<string, RegisteredGroup>;
   registerGroup: (jid: string, group: RegisteredGroup) => void;
   syncGroups: (force: boolean) => Promise<void>;
@@ -23,6 +31,33 @@ export interface IpcDeps {
     registeredJids: Set<string>,
   ) => void;
   onTasksChanged: () => void;
+}
+
+// Container mounts the group folder at /workspace/group; translate the agent's
+// container-relative path back to the host path, rejecting anything outside
+// the group's folder so a compromised agent can't exfiltrate arbitrary files.
+const CONTAINER_GROUP_MOUNT = '/workspace/group';
+
+function resolveContainerFilePath(
+  requested: string,
+  sourceGroup: string,
+): string | null {
+  if (!requested || typeof requested !== 'string') return null;
+  const groupHostDir = resolveGroupFolderPath(sourceGroup);
+
+  let relative: string;
+  if (requested.startsWith(CONTAINER_GROUP_MOUNT)) {
+    relative = requested.slice(CONTAINER_GROUP_MOUNT.length).replace(/^\/+/, '');
+  } else if (path.isAbsolute(requested)) {
+    return null;
+  } else {
+    relative = requested;
+  }
+
+  const resolved = path.resolve(groupHostDir, relative);
+  const rel = path.relative(groupHostDir, resolved);
+  if (rel.startsWith('..') || path.isAbsolute(rel)) return null;
+  return resolved;
 }
 
 let ipcWatcherRunning = false;
@@ -91,6 +126,50 @@ export function startIpcWatcher(deps: IpcDeps): void {
                     { chatJid: data.chatJid, sourceGroup },
                     'Unauthorized IPC message attempt blocked',
                   );
+                }
+              } else if (
+                data.type === 'file_upload' &&
+                data.chatJid &&
+                data.filePath
+              ) {
+                const targetGroup = registeredGroups[data.chatJid];
+                const authorized =
+                  isMain ||
+                  (targetGroup && targetGroup.folder === sourceGroup);
+                if (!authorized) {
+                  logger.warn(
+                    { chatJid: data.chatJid, sourceGroup },
+                    'Unauthorized IPC file upload blocked',
+                  );
+                } else {
+                  const hostPath = resolveContainerFilePath(
+                    data.filePath,
+                    sourceGroup,
+                  );
+                  if (!hostPath) {
+                    logger.warn(
+                      {
+                        chatJid: data.chatJid,
+                        sourceGroup,
+                        requested: data.filePath,
+                      },
+                      'IPC file upload rejected: path escapes group folder',
+                    );
+                  } else if (!fs.existsSync(hostPath)) {
+                    logger.warn(
+                      { chatJid: data.chatJid, sourceGroup, hostPath },
+                      'IPC file upload rejected: file not found',
+                    );
+                  } else {
+                    await deps.sendFile(data.chatJid, hostPath, {
+                      title: data.title,
+                      initialComment: data.initialComment,
+                    });
+                    logger.info(
+                      { chatJid: data.chatJid, sourceGroup, hostPath },
+                      'IPC file uploaded',
+                    );
+                  }
                 }
               }
               fs.unlinkSync(filePath);

@@ -90,6 +90,11 @@ export interface TaskRunLog {
 
 // --- Channel abstraction ---
 
+export interface SendFileOpts {
+  title?: string;
+  initialComment?: string;
+}
+
 export interface Channel {
   name: string;
   connect(): Promise<void>;
@@ -101,6 +106,9 @@ export interface Channel {
   setTyping?(jid: string, isTyping: boolean): Promise<void>;
   // Optional: sync group/chat names from the platform.
   syncGroups?(force: boolean): Promise<void>;
+  // Optional: upload a file (PDF, image, etc.) to the chat. Host-side so the
+  // platform bot token never leaves the host process.
+  sendFile?(jid: string, filePath: string, opts?: SendFileOpts): Promise<void>;
 }
 
 // Callback type that channels use to deliver inbound messages

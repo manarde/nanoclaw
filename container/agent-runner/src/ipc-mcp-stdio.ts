@@ -68,6 +68,46 @@ server.tool(
 );
 
 server.tool(
+  'send_file',
+  `Upload a file (PDF, image, document, etc.) to the current chat. The host process performs the upload using the platform's bot credentials — you do not need a token.
+
+Works on channels that support file upload (currently Slack). Other channels will return an error.
+
+The file must live under your group folder (mounted at /workspace/group). Pass either an absolute path like "/workspace/group/reports/q1.pdf" or a relative path like "reports/q1.pdf".`,
+  {
+    file_path: z
+      .string()
+      .describe(
+        'Path to the file, under /workspace/group (absolute or relative to it)',
+      ),
+    title: z.string().optional().describe('Optional display title for the file'),
+    initial_comment: z
+      .string()
+      .optional()
+      .describe('Optional message text posted with the file'),
+  },
+  async (args) => {
+    const data: Record<string, string | undefined> = {
+      type: 'file_upload',
+      chatJid,
+      filePath: args.file_path,
+      title: args.title,
+      initialComment: args.initial_comment,
+      groupFolder,
+      timestamp: new Date().toISOString(),
+    };
+
+    writeIpcFile(MESSAGES_DIR, data);
+
+    return {
+      content: [
+        { type: 'text' as const, text: `File upload queued: ${args.file_path}` },
+      ],
+    };
+  },
+);
+
+server.tool(
   'schedule_task',
   `Schedule a recurring or one-time task. The task will run as a full agent with access to all tools. Returns the task ID for future reference. To modify an existing task, use update_task instead.
 

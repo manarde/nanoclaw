@@ -1,3 +1,5 @@
+import path from 'path';
+
 import { App, LogLevel } from '@slack/bolt';
 import type { GenericMessageEvent, BotMessageEvent } from '@slack/types';
 import sharp from 'sharp';
@@ -14,6 +16,7 @@ import {
   OnInboundMessage,
   OnChatMetadata,
   RegisteredGroup,
+  SendFileOpts,
 } from '../types.js';
 
 // Slack's chat.postMessage API limits text to ~4000 characters per call.
@@ -414,6 +417,24 @@ export class SlackChannel implements Channel {
         'Failed to send Slack message, queued',
       );
     }
+  }
+
+  async sendFile(
+    jid: string,
+    filePath: string,
+    opts: SendFileOpts = {},
+  ): Promise<void> {
+    const channelId = jid.replace(/^slack:/, '');
+
+    // uploadV2 handles getUploadURLExternal → PUT → completeUploadExternal in one call.
+    await this.app.client.files.uploadV2({
+      channel_id: channelId,
+      file: filePath,
+      filename: path.basename(filePath),
+      title: opts.title,
+      initial_comment: opts.initialComment,
+    });
+    logger.info({ jid, filePath }, 'Slack file uploaded');
   }
 
   isConnected(): boolean {

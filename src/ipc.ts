@@ -70,7 +70,13 @@ const CLAUDE_BIN = process.env.CLAUDE_BIN || 'claude';
 
 function pitchbookWatchlistExists(slug: string): boolean {
   if (slug === 'all') return true;
-  const p = path.join(process.cwd(), 'data', 'pitchbook', 'watchlists', `${slug}.json`);
+  const p = path.join(
+    process.cwd(),
+    'data',
+    'pitchbook',
+    'watchlists',
+    `${slug}.json`,
+  );
   return fs.existsSync(p);
 }
 
@@ -557,7 +563,14 @@ export async function processTaskIpc(
       break;
 
     case 'pitchbook_check': {
-      if (!isMain) {
+      const sourceReg = Object.values(registeredGroups).find(
+        (g) => g.folder === sourceGroup,
+      );
+      const trustedForThisAction =
+        sourceReg?.containerConfig?.trustedHostActions?.includes(
+          'pitchbook_check',
+        ) === true;
+      if (!isMain && !trustedForThisAction) {
         logger.warn(
           { sourceGroup },
           'Unauthorized pitchbook_check attempt blocked',
@@ -625,11 +638,17 @@ export async function processTaskIpc(
           'pitchbook-alerts check finished',
         );
         if (code !== 0) {
-          logger.warn({ slug, stderr: stderr.slice(0, 2000) }, 'pitchbook-alerts check failed');
+          logger.warn(
+            { slug, stderr: stderr.slice(0, 2000) },
+            'pitchbook-alerts check failed',
+          );
         }
       });
       child.on('error', (err) => {
-        logger.error({ slug, err }, 'Failed to spawn claude for pitchbook-alerts');
+        logger.error(
+          { slug, err },
+          'Failed to spawn claude for pitchbook-alerts',
+        );
       });
       break;
     }

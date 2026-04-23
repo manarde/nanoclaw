@@ -30,6 +30,11 @@ export interface AllowedRoot {
 export interface ContainerConfig {
   additionalMounts?: AdditionalMount[];
   timeout?: number; // Default: 300000 (5 minutes)
+  // Names of host-mediated IPC triggers this non-main group is allowed to
+  // invoke (e.g. "pitchbook_check"). Main groups bypass this list. Lets
+  // trusted groups run privileged host-side actions without full main
+  // privileges like register_group.
+  trustedHostActions?: string[];
 }
 
 export interface RegisteredGroup {

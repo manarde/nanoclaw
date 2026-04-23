@@ -250,8 +250,8 @@ Or the user can ask their NanoClaw agent to schedule a task:
 → Agent creates cron task via IPC that triggers this skill
 ```
 
-### From NanoClaw agent
-The container agent can request a PitchBook check by messaging the main group. The host-side skill handles the MCP calls since PitchBook auth lives at the host level.
+### From NanoClaw agent (IPC trigger)
+Container agents call the `run_pitchbook_check` MCP tool (takes a watchlist slug or "all"). The NanoClaw daemon validates the request (main group only, slug must resolve to an existing watchlist, 5-minute debounce per slug) and spawns `claude -p "/pitchbook-alerts check <slug>"` at the host — which runs this skill with full PitchBook MCP access. The headless run is expected to deliver its digest by writing a `type: "message"` IPC file to `data/ipc/main/messages/` targeting the jid of the watchlist's `digest_channel`, so the daemon routes it through the appropriate channel adapter.
 
 ## Important Notes
 

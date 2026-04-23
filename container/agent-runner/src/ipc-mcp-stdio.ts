@@ -483,6 +483,41 @@ server.tool(
 );
 
 server.tool(
+  'run_pitchbook_check',
+  `Trigger a PitchBook watchlist check on the host. Main group only — other groups will see the request silently dropped.
+
+The check runs host-side via the \`/pitchbook-alerts check\` slash command, which has access to the PitchBook MCP. Alerts/digests are delivered by the skill itself (to whichever channel the watchlist is configured for).
+
+Watchlists live at data/pitchbook/watchlists/<slug>.json. Pass "all" to check every watchlist.
+
+Debounced: a given watchlist can only be triggered once per 5 minutes.`,
+  {
+    watchlist: z
+      .string()
+      .describe(
+        'Watchlist slug (e.g. "ai-rollups") or "all" to check every watchlist',
+      ),
+  },
+  async (args) => {
+    const data = {
+      type: 'pitchbook_check',
+      watchlist: args.watchlist,
+      groupFolder,
+      timestamp: new Date().toISOString(),
+    };
+    writeIpcFile(TASKS_DIR, data);
+    return {
+      content: [
+        {
+          type: 'text' as const,
+          text: `PitchBook check requested for "${args.watchlist}". The host will run the check asynchronously and post any alerts/digests to the watchlist's configured channel.`,
+        },
+      ],
+    };
+  },
+);
+
+server.tool(
   'register_group',
   `Register a new chat/group so the agent can respond to messages there. Main group only.
 

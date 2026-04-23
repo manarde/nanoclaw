@@ -1,3 +1,4 @@
+import { spawn } from 'child_process';
 import fs from 'fs';
 import path from 'path';
 
@@ -6,10 +7,7 @@ import { CronExpressionParser } from 'cron-parser';
 import { DATA_DIR, IPC_POLL_INTERVAL, TIMEZONE } from './config.js';
 import { AvailableGroup } from './container-runner.js';
 import { createTask, deleteTask, getTaskById, updateTask } from './db.js';
-import {
-  isValidGroupFolder,
-  resolveGroupFolderPath,
-} from './group-folder.js';
+import { isValidGroupFolder, resolveGroupFolderPath } from './group-folder.js';
 import { logger } from './logger.js';
 import { RegisteredGroup, SendFileOpts } from './types.js';
 
@@ -47,7 +45,9 @@ function resolveContainerFilePath(
 
   let relative: string;
   if (requested.startsWith(CONTAINER_GROUP_MOUNT)) {
-    relative = requested.slice(CONTAINER_GROUP_MOUNT.length).replace(/^\/+/, '');
+    relative = requested
+      .slice(CONTAINER_GROUP_MOUNT.length)
+      .replace(/^\/+/, '');
   } else if (path.isAbsolute(requested)) {
     return null;
   } else {
@@ -58,6 +58,20 @@ function resolveContainerFilePath(
   const rel = path.relative(groupHostDir, resolved);
   if (rel.startsWith('..') || path.isAbsolute(rel)) return null;
   return resolved;
+}
+
+// PitchBook MCP runs at the host level (Claude Code), not inside containers.
+// Agents can trigger `/pitchbook-alerts check <watchlist>` via IPC. Restricted
+// to main group to avoid compromised non-main containers burning API quota.
+const PITCHBOOK_DEBOUNCE_MS = 5 * 60 * 1000;
+const pitchbookLastRun = new Map<string, number>();
+const WATCHLIST_SLUG_PATTERN = /^[a-z0-9][a-z0-9-]{0,63}$/;
+const CLAUDE_BIN = process.env.CLAUDE_BIN || 'claude';
+
+function pitchbookWatchlistExists(slug: string): boolean {
+  if (slug === 'all') return true;
+  const p = path.join(process.cwd(), 'data', 'pitchbook', 'watchlists', `${slug}.json`);
+  return fs.existsSync(p);
 }
 
 let ipcWatcherRunning = false;
@@ -134,8 +148,7 @@ export function startIpcWatcher(deps: IpcDeps): void {
               ) {
                 const targetGroup = registeredGroups[data.chatJid];
                 const authorized =
-                  isMain ||
-                  (targetGroup && targetGroup.folder === sourceGroup);
+                  isMain || (targetGroup && targetGroup.folder === sourceGroup);
                 if (!authorized) {
                   logger.warn(
                     { chatJid: data.chatJid, sourceGroup },
@@ -252,6 +265,8 @@ export async function processTaskIpc(
     trigger?: string;
     requiresTrigger?: boolean;
     containerConfig?: RegisteredGroup['containerConfig'];
+    // For pitchbook_check
+    watchlist?: string;
   },
   sourceGroup: string, // Verified identity from IPC directory
   isMain: boolean, // Verified from directory path
@@ -540,6 +555,84 @@ export async function processTaskIpc(
         );
       }
       break;
+
+    case 'pitchbook_check': {
+      if (!isMain) {
+        logger.warn(
+          { sourceGroup },
+          'Unauthorized pitchbook_check attempt blocked',
+        );
+        break;
+      }
+      const slug = (data.watchlist || '').trim();
+      if (!slug || (slug !== 'all' && !WATCHLIST_SLUG_PATTERN.test(slug))) {
+        logger.warn(
+          { sourceGroup, slug },
+          'pitchbook_check rejected: invalid watchlist slug',
+        );
+        break;
+      }
+      if (!pitchbookWatchlistExists(slug)) {
+        logger.warn(
+          { sourceGroup, slug },
+          'pitchbook_check rejected: watchlist not found',
+        );
+        break;
+      }
+      const now = Date.now();
+      const last = pitchbookLastRun.get(slug) || 0;
+      if (now - last < PITCHBOOK_DEBOUNCE_MS) {
+        logger.warn(
+          {
+            sourceGroup,
+            slug,
+            sinceLastMs: now - last,
+            debounceMs: PITCHBOOK_DEBOUNCE_MS,
+          },
+          'pitchbook_check debounced',
+        );
+        break;
+      }
+      pitchbookLastRun.set(slug, now);
+      logger.info(
+        { sourceGroup, slug },
+        'Spawning pitchbook-alerts check via claude CLI',
+      );
+      const child = spawn(
+        CLAUDE_BIN,
+        [
+          '-p',
+          '--dangerously-skip-permissions',
+          `/pitchbook-alerts check ${slug}`,
+        ],
+        {
+          cwd: process.cwd(),
+          stdio: ['ignore', 'pipe', 'pipe'],
+          detached: false,
+        },
+      );
+      let stdout = '';
+      let stderr = '';
+      child.stdout?.on('data', (c) => {
+        stdout += c.toString();
+      });
+      child.stderr?.on('data', (c) => {
+        stderr += c.toString();
+      });
+      child.on('exit', (code) => {
+        logger.info(
+          { slug, code, stdoutLen: stdout.length, stderrLen: stderr.length },
+          'pitchbook-alerts check finished',
+        );
+        if (code !== 0) {
+          logger.warn({ slug, stderr: stderr.slice(0, 2000) }, 'pitchbook-alerts check failed');
+        }
+      });
+      child.on('error', (err) => {
+        logger.error({ slug, err }, 'Failed to spawn claude for pitchbook-alerts');
+      });
+      break;
+    }
 
     default:
       logger.warn({ type: data.type }, 'Unknown IPC task type');

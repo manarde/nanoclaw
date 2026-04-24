@@ -198,6 +198,7 @@ function buildVolumeMounts(
   fs.mkdirSync(path.join(groupIpcDir, 'messages'), { recursive: true });
   fs.mkdirSync(path.join(groupIpcDir, 'tasks'), { recursive: true });
   fs.mkdirSync(path.join(groupIpcDir, 'input'), { recursive: true });
+  fs.mkdirSync(path.join(groupIpcDir, 'host-mcp-requests'), { recursive: true });
   mounts.push({
     hostPath: groupIpcDir,
     containerPath: '/workspace/ipc',
@@ -250,11 +251,19 @@ async function buildContainerArgs(
   mounts: VolumeMount[],
   containerName: string,
   agentIdentifier?: string,
+  isScheduledTask?: boolean,
 ): Promise<string[]> {
   const args: string[] = ['run', '-i', '--rm', '--name', containerName];
 
   // Pass host timezone so container's local time matches the user's
   args.push('-e', `TZ=${TIMEZONE}`);
+
+  // Mark scheduled-task spawns so host-facing MCP tools can refuse to run
+  // in a context where the prompt may have been seeded by prior chat text
+  // (prompt-injection surface). Consumers: container/agent-runner host-MCP gate.
+  if (isScheduledTask) {
+    args.push('-e', 'NANOCLAW_IS_SCHEDULED_TASK=1');
+  }
 
   // Forward Ollama admin tools flag if enabled
   if (OLLAMA_ADMIN_TOOLS) {
@@ -329,6 +338,7 @@ export async function runContainerAgent(
     mounts,
     containerName,
     agentIdentifier,
+    input.isScheduledTask,
   );
 
   logger.debug(

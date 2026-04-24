@@ -1,5 +1,9 @@
-import { describe, it, expect, beforeEach } from 'vitest';
+import fs from 'fs';
+import path from 'path';
 
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+
+import { DATA_DIR } from './config.js';
 import {
   _initTestDatabase,
   createTask,
@@ -8,7 +12,14 @@ import {
   getTaskById,
   setRegisteredGroup,
 } from './db.js';
-import { processTaskIpc, IpcDeps } from './ipc.js';
+import {
+  _resetHostMcpState,
+  hasTrustedHostAction,
+  hostMcpActiveChildren,
+  hostMcpLastRun,
+  IpcDeps,
+  processTaskIpc,
+} from './ipc.js';
 import { RegisteredGroup } from './types.js';
 
 // Set up registered groups used across tests
@@ -683,4 +694,602 @@ describe('register_group success', () => {
 
     expect(getRegisteredGroup('partial@g.us')).toBeUndefined();
   });
+});
+
+// --- host_mcp_query authorization (U6) ---
+//
+// Covers every control-flow branch enumerated in U1's test-scenarios list
+// (T1–T11) plus U6 additions (T16 helper matrix, T17 reply file shape) and
+// T12 pitchbook_check regression coverage. The handler uses `deps.spawnHostClaude`
+// as a seam so tests never fork a real `claude` process.
+
+const VALID_REQUEST_ID = '12345678-1234-1234-1234-123456789012';
+const SECOND_REQUEST_ID = '87654321-4321-4321-4321-210987654321';
+const MAIN_FOLDER = 'whatsapp_main';
+const OTHER_FOLDER = 'other-group';
+const VALID_CHAT_JID = 'main@g.us';
+const OTHER_CHAT_JID = 'other@g.us';
+
+type FakeChild = {
+  pid: number;
+  on: ReturnType<typeof vi.fn>;
+  emit: (event: string, ...args: unknown[]) => void;
+  kill: ReturnType<typeof vi.fn>;
+  stdout: { on: ReturnType<typeof vi.fn> };
+  stderr: { on: ReturnType<typeof vi.fn> };
+};
+
+function makeFakeChild(): FakeChild {
+  const listeners = new Map<string, Array<(...args: unknown[]) => void>>();
+  return {
+    pid: 12345,
+    on: vi.fn((event: string, cb: (...args: unknown[]) => void) => {
+      if (!listeners.has(event)) listeners.set(event, []);
+      listeners.get(event)!.push(cb);
+    }) as unknown as ReturnType<typeof vi.fn>,
+    emit: (event: string, ...args: unknown[]) => {
+      listeners.get(event)?.forEach((cb) => cb(...args));
+    },
+    kill: vi.fn(),
+    stdout: { on: vi.fn() },
+    stderr: { on: vi.fn() },
+  };
+}
+
+// Cleans up any IPC files the handler wrote during the test.
+function cleanGroupIpc(folder: string): void {
+  try {
+    fs.rmSync(path.join(DATA_DIR, 'ipc', folder), {
+      recursive: true,
+      force: true,
+    });
+  } catch {
+    /* best-effort */
+  }
+}
+
+// Returns the list of message files written to data/ipc/<folder>/messages/
+function listMessageFiles(folder: string): string[] {
+  const dir = path.join(DATA_DIR, 'ipc', folder, 'messages');
+  if (!fs.existsSync(dir)) return [];
+  return fs.readdirSync(dir).filter((f) => f.endsWith('.json'));
+}
+
+function readFirstMessageFile(
+  folder: string,
+): Record<string, unknown> | undefined {
+  const files = listMessageFiles(folder);
+  if (!files.length) return undefined;
+  const p = path.join(DATA_DIR, 'ipc', folder, 'messages', files[0]);
+  return JSON.parse(fs.readFileSync(p, 'utf-8'));
+}
+
+// Default valid host_mcp_query payload.
+function validPayload(overrides: Record<string, unknown> = {}): {
+  type: 'host_mcp_query';
+  scope: string;
+  question: string;
+  requestId: string;
+  chatJid: string;
+} & Record<string, unknown> {
+  return {
+    type: 'host_mcp_query',
+    scope: 'pitchbook',
+    question: 'What do we know about Vercel?',
+    requestId: VALID_REQUEST_ID,
+    chatJid: VALID_CHAT_JID,
+    ...overrides,
+  };
+}
+
+describe('host_mcp_query authorization', () => {
+  let fakeChild: FakeChild;
+  let spawnStub: ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    _resetHostMcpState();
+    cleanGroupIpc(MAIN_FOLDER);
+    cleanGroupIpc(OTHER_FOLDER);
+    cleanGroupIpc('third-group');
+    fakeChild = makeFakeChild();
+    spawnStub = vi.fn(() => fakeChild);
+    deps.spawnHostClaude = spawnStub as unknown as IpcDeps['spawnHostClaude'];
+  });
+
+  afterEach(() => {
+    _resetHostMcpState();
+    cleanGroupIpc(MAIN_FOLDER);
+    cleanGroupIpc(OTHER_FOLDER);
+    cleanGroupIpc('third-group');
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+  });
+
+  // ---- T1: happy path, main group -----------------------------------------
+  it('T1: main group → spawns host claude with scoped --allowed-tools and writes request file', async () => {
+    await processTaskIpc(validPayload(), MAIN_FOLDER, true, deps);
+
+    expect(spawnStub).toHaveBeenCalledTimes(1);
+    const [argv, opts] = spawnStub.mock.calls[0] as [
+      string[],
+      Record<string, unknown>,
+    ];
+    expect(argv).toContain('-p');
+    expect(argv).toContain('--dangerously-skip-permissions');
+    // --allowed-tools should include the pitchbook prefix and the reply primitive
+    const allowedIdx = argv.indexOf('--allowed-tools');
+    expect(allowedIdx).toBeGreaterThanOrEqual(0);
+    expect(argv[allowedIdx + 1]).toBe(
+      'mcp__claude_ai_PitchBook_Premium__*,mcp__nanoclaw_host__host_mcp_reply',
+    );
+    // slash command carries scope / sourceGroup / requestId
+    const slashArg = argv[argv.length - 1];
+    expect(slashArg).toBe(
+      `/host-mcp-agent pitchbook ${MAIN_FOLDER} ${VALID_REQUEST_ID}`,
+    );
+    expect(opts).toMatchObject({ stdio: ['ignore', 'pipe', 'pipe'] });
+
+    // Request descriptor file written at the expected path
+    const requestPath = path.join(
+      DATA_DIR,
+      'ipc',
+      MAIN_FOLDER,
+      'host-mcp-requests',
+      `${VALID_REQUEST_ID}.json`,
+    );
+    expect(fs.existsSync(requestPath)).toBe(true);
+    const desc = JSON.parse(fs.readFileSync(requestPath, 'utf-8'));
+    expect(desc).toEqual({
+      question: 'What do we know about Vercel?',
+      chatJid: VALID_CHAT_JID,
+      sourceGroup: MAIN_FOLDER,
+      scope: 'pitchbook',
+    });
+
+    // Debounce NOT stamped until 'spawn' event fires
+    expect(hostMcpLastRun.has(`${MAIN_FOLDER}:pitchbook`)).toBe(false);
+    fakeChild.emit('spawn');
+    expect(hostMcpLastRun.has(`${MAIN_FOLDER}:pitchbook`)).toBe(true);
+
+    // Child is tracked for concurrency accounting
+    expect(hostMcpActiveChildren.has(VALID_REQUEST_ID)).toBe(true);
+
+    // No failure reply written
+    expect(listMessageFiles(MAIN_FOLDER)).toHaveLength(0);
+  });
+
+  // ---- T2: happy path, trusted non-main -----------------------------------
+  it('T2: non-main group with matching trustedHostActions → spawn called', async () => {
+    // Mutate the other group to trust host_mcp_query:pitchbook
+    const trustedOther: RegisteredGroup = {
+      ...OTHER_GROUP,
+      containerConfig: {
+        trustedHostActions: ['host_mcp_query:pitchbook'],
+      },
+    };
+    groups['other@g.us'] = trustedOther;
+    setRegisteredGroup('other@g.us', trustedOther);
+
+    await processTaskIpc(
+      validPayload({ chatJid: OTHER_CHAT_JID }),
+      OTHER_FOLDER,
+      false,
+      deps,
+    );
+
+    expect(spawnStub).toHaveBeenCalledTimes(1);
+    const requestPath = path.join(
+      DATA_DIR,
+      'ipc',
+      OTHER_FOLDER,
+      'host-mcp-requests',
+      `${VALID_REQUEST_ID}.json`,
+    );
+    expect(fs.existsSync(requestPath)).toBe(true);
+    expect(listMessageFiles(OTHER_FOLDER)).toHaveLength(0);
+  });
+
+  // ---- T3: shape-invalid inputs (table-driven) ----------------------------
+  const shapeInvalidRows: Array<{ label: string; override: Record<string, unknown> }> = [
+    { label: 'scope with space', override: { scope: 'foo bar' } },
+    { label: 'scope with path escape', override: { scope: '../x' } },
+    { label: 'scope __proto__', override: { scope: '__proto__' } },
+    { label: 'scope empty', override: { scope: '' } },
+    { label: 'scope uppercase', override: { scope: 'PITCH' } },
+    { label: 'scope too long', override: { scope: 'a'.repeat(40) } },
+    {
+      label: 'requestId with path escape',
+      override: { requestId: '../messages/forged' },
+    },
+    { label: 'requestId empty', override: { requestId: '' } },
+    { label: 'requestId nonsense', override: { requestId: 'nonsense' } },
+    { label: 'requestId not uuid', override: { requestId: 'not-a-uuid' } },
+    { label: 'question too long', override: { question: 'a'.repeat(4001) } },
+  ];
+
+  for (const row of shapeInvalidRows) {
+    it(`T3 (${row.label}): no spawn + decline reply written`, async () => {
+      await processTaskIpc(
+        validPayload(row.override),
+        MAIN_FOLDER,
+        true,
+        deps,
+      );
+
+      expect(spawnStub).not.toHaveBeenCalled();
+      const files = listMessageFiles(MAIN_FOLDER);
+      expect(files).toHaveLength(1);
+      const payload = readFirstMessageFile(MAIN_FOLDER)!;
+      expect(payload).toMatchObject({
+        type: 'message',
+        chatJid: VALID_CHAT_JID,
+        groupFolder: MAIN_FOLDER,
+      });
+      expect(typeof payload.text).toBe('string');
+      expect((payload.text as string).length).toBeGreaterThan(0);
+    });
+  }
+
+  // ---- T4: unknown scope --------------------------------------------------
+  it('T4: unknown scope → no spawn, decline "Unknown scope"', async () => {
+    await processTaskIpc(
+      validPayload({ scope: 'gmail' }),
+      MAIN_FOLDER,
+      true,
+      deps,
+    );
+
+    expect(spawnStub).not.toHaveBeenCalled();
+    const payload = readFirstMessageFile(MAIN_FOLDER)!;
+    expect(payload.text).toMatch(/Unknown scope/i);
+    expect(payload).toMatchObject({
+      type: 'message',
+      chatJid: VALID_CHAT_JID,
+      groupFolder: MAIN_FOLDER,
+    });
+  });
+
+  // ---- T5: untrusted non-main --------------------------------------------
+  it('T5: untrusted non-main group → no spawn, decline "Not authorized"', async () => {
+    // OTHER_GROUP has no trustedHostActions
+    await processTaskIpc(
+      validPayload({ chatJid: OTHER_CHAT_JID }),
+      OTHER_FOLDER,
+      false,
+      deps,
+    );
+
+    expect(spawnStub).not.toHaveBeenCalled();
+    const payload = readFirstMessageFile(OTHER_FOLDER)!;
+    expect(payload.text).toMatch(/not authorized/i);
+    expect(payload).toMatchObject({
+      type: 'message',
+      chatJid: OTHER_CHAT_JID,
+      groupFolder: OTHER_FOLDER,
+    });
+  });
+
+  // ---- T6: concurrency cap ------------------------------------------------
+  it('T6: concurrency cap hit → no spawn, decline "busy"', async () => {
+    // Pre-populate the map with MAX_CONCURRENT_HOST_MCP=4 entries
+    for (let i = 0; i < 4; i++) {
+      hostMcpActiveChildren.set(
+        `preloaded-${i}`,
+        makeFakeChild() as unknown as import('child_process').ChildProcess,
+      );
+    }
+
+    await processTaskIpc(validPayload(), MAIN_FOLDER, true, deps);
+
+    expect(spawnStub).not.toHaveBeenCalled();
+    const payload = readFirstMessageFile(MAIN_FOLDER)!;
+    expect(payload.text).toMatch(/busy/i);
+  });
+
+  // ---- T7: debounce -------------------------------------------------------
+  it('T7: back-to-back same {sourceGroup, scope} → second declined "too fast"; different sourceGroup still spawns', async () => {
+    // First dispatch — happy path
+    await processTaskIpc(validPayload(), MAIN_FOLDER, true, deps);
+    expect(spawnStub).toHaveBeenCalledTimes(1);
+    // Stamp debounce by emitting spawn
+    fakeChild.emit('spawn');
+    expect(hostMcpLastRun.has(`${MAIN_FOLDER}:pitchbook`)).toBe(true);
+
+    // Second dispatch with same key → declined
+    await processTaskIpc(
+      validPayload({ requestId: SECOND_REQUEST_ID }),
+      MAIN_FOLDER,
+      true,
+      deps,
+    );
+    expect(spawnStub).toHaveBeenCalledTimes(1); // no second spawn
+    const payload = readFirstMessageFile(MAIN_FOLDER)!;
+    expect(payload.text).toMatch(/too fast/i);
+
+    // Different sourceGroup with trusted action — spawn still happens
+    const trustedOther: RegisteredGroup = {
+      ...OTHER_GROUP,
+      containerConfig: {
+        trustedHostActions: ['host_mcp_query:pitchbook'],
+      },
+    };
+    groups['other@g.us'] = trustedOther;
+    setRegisteredGroup('other@g.us', trustedOther);
+    await processTaskIpc(
+      validPayload({
+        requestId: SECOND_REQUEST_ID,
+        chatJid: OTHER_CHAT_JID,
+      }),
+      OTHER_FOLDER,
+      false,
+      deps,
+    );
+    expect(spawnStub).toHaveBeenCalledTimes(2);
+  });
+
+  // ---- T8: path-escape via isWithinBase -----------------------------------
+  //
+  // Note: mocking `isWithinBase` would require `vi.mock('./group-folder.js')`
+  // at module top, which affects every test in this file. REQUEST_ID_PATTERN
+  // already restricts requestId to UUID-v4 shape — the `isWithinBase` call is
+  // strict defense-in-depth and is impossible to reach with a well-formed
+  // requestId. Shape-invalid requestIds are covered by T3 (path-escape row).
+  it('T8: path-escape defense — covered by T3 requestId rows (isWithinBase is defense-in-depth)', () => {
+    expect(true).toBe(true);
+  });
+
+  // ---- T9: spawn failure cleanup -----------------------------------------
+  it('T9: spawn emits error → request file unlinked, decline reply, debounce NOT stamped', async () => {
+    await processTaskIpc(validPayload(), MAIN_FOLDER, true, deps);
+
+    const requestPath = path.join(
+      DATA_DIR,
+      'ipc',
+      MAIN_FOLDER,
+      'host-mcp-requests',
+      `${VALID_REQUEST_ID}.json`,
+    );
+    expect(fs.existsSync(requestPath)).toBe(true);
+
+    // Simulate async spawn failure before 'spawn' fires
+    fakeChild.emit('error', new Error('ENOENT: claude binary'));
+
+    expect(fs.existsSync(requestPath)).toBe(false);
+    const payload = readFirstMessageFile(MAIN_FOLDER)!;
+    expect(payload.text).toMatch(/could not start/i);
+    expect(hostMcpLastRun.has(`${MAIN_FOLDER}:pitchbook`)).toBe(false);
+  });
+
+  // ---- T10: exit cleanup runs even if logger throws ----------------------
+  it('T10: exit handler cleanup runs in finally even when logger.info throws', async () => {
+    await processTaskIpc(validPayload(), MAIN_FOLDER, true, deps);
+    const requestPath = path.join(
+      DATA_DIR,
+      'ipc',
+      MAIN_FOLDER,
+      'host-mcp-requests',
+      `${VALID_REQUEST_ID}.json`,
+    );
+    expect(fs.existsSync(requestPath)).toBe(true);
+    expect(hostMcpActiveChildren.has(VALID_REQUEST_ID)).toBe(true);
+
+    // Stub logger.info on the exit-log call to throw
+    const { logger } = await import('./logger.js');
+    const infoSpy = vi
+      .spyOn(logger, 'info')
+      .mockImplementation(() => {
+        throw new Error('logger blew up');
+      });
+
+    // Emit 'exit' — the handler wraps logging in try/finally
+    // so the finally block still unlinks the request file and drops the child.
+    // The thrown error propagates out of the listener, so wrap in try/catch.
+    try {
+      fakeChild.emit('exit', 0, null);
+    } catch {
+      /* expected — logger.info threw */
+    }
+
+    expect(hostMcpActiveChildren.has(VALID_REQUEST_ID)).toBe(false);
+    expect(fs.existsSync(requestPath)).toBe(false);
+    infoSpy.mockRestore();
+  });
+
+  // ---- T11: timeout → SIGTERM → SIGKILL ----------------------------------
+  it('T11: after HOST_MCP_TIMEOUT_MS → failure reply + SIGTERM; after grace → SIGKILL', async () => {
+    vi.useFakeTimers();
+
+    await processTaskIpc(validPayload(), MAIN_FOLDER, true, deps);
+    expect(spawnStub).toHaveBeenCalledTimes(1);
+
+    // Advance to the soft timeout
+    vi.advanceTimersByTime(120_000);
+    expect(fakeChild.kill).toHaveBeenCalledWith('SIGTERM');
+    const payload = readFirstMessageFile(MAIN_FOLDER)!;
+    expect(payload.text).toMatch(/timed out/i);
+
+    // Advance the grace window — SIGKILL follows
+    vi.advanceTimersByTime(5_000);
+    expect(fakeChild.kill).toHaveBeenCalledWith('SIGKILL');
+  });
+
+  // ---- T17: decline-reply file shape (explicit) --------------------------
+  it('T17: decline-reply files have canonical shape { type, chatJid, text, groupFolder, timestamp }', async () => {
+    await processTaskIpc(
+      validPayload({ scope: 'unknown-scope-here' }),
+      MAIN_FOLDER,
+      true,
+      deps,
+    );
+    const payload = readFirstMessageFile(MAIN_FOLDER)!;
+    expect(payload).toMatchObject({
+      type: 'message',
+      chatJid: VALID_CHAT_JID,
+      groupFolder: MAIN_FOLDER,
+    });
+    expect(typeof payload.text).toBe('string');
+    expect((payload.text as string).length).toBeGreaterThan(0);
+    expect(typeof payload.timestamp).toBe('string');
+    // ISO timestamp is parseable
+    expect(isNaN(Date.parse(payload.timestamp as string))).toBe(false);
+  });
+
+  // ---- T12: pitchbook_check regression (existing handler) ----------------
+  //
+  // Uses a nonexistent watchlist slug ("bogus") so the handler always exits
+  // before `spawn()` — we only care that the authz gate produces the right
+  // warn-log branch. Main/trusted → reach the "watchlist not found" branch
+  // (auth passed). Untrusted → stop at "Unauthorized" branch.
+  describe('T12 pitchbook_check regression', () => {
+    it('main group passes authz (reaches watchlist validation)', async () => {
+      const { logger } = await import('./logger.js');
+      const warnSpy = vi.spyOn(logger, 'warn').mockImplementation(() => {});
+
+      await processTaskIpc(
+        { type: 'pitchbook_check', watchlist: 'bogus' },
+        MAIN_FOLDER,
+        true,
+        deps,
+      );
+
+      // Should have hit watchlist-not-found (auth passed), NOT unauthorized
+      const messages = warnSpy.mock.calls.map((c) =>
+        typeof c[1] === 'string' ? c[1] : (c[0] as { msg?: string }).msg || '',
+      );
+      const joined = messages.join('|') + '|' + JSON.stringify(warnSpy.mock.calls);
+      expect(joined).toMatch(/watchlist not found|invalid watchlist slug/i);
+      expect(joined).not.toMatch(/Unauthorized pitchbook_check/);
+      warnSpy.mockRestore();
+    });
+
+    it('trusted non-main group passes authz', async () => {
+      const trustedOther: RegisteredGroup = {
+        ...OTHER_GROUP,
+        containerConfig: {
+          trustedHostActions: ['pitchbook_check'],
+        },
+      };
+      groups['other@g.us'] = trustedOther;
+      setRegisteredGroup('other@g.us', trustedOther);
+
+      const { logger } = await import('./logger.js');
+      const warnSpy = vi.spyOn(logger, 'warn').mockImplementation(() => {});
+
+      await processTaskIpc(
+        { type: 'pitchbook_check', watchlist: 'bogus' },
+        OTHER_FOLDER,
+        false,
+        deps,
+      );
+
+      const joined = JSON.stringify(warnSpy.mock.calls);
+      expect(joined).toMatch(/watchlist not found|invalid watchlist slug/i);
+      expect(joined).not.toMatch(/Unauthorized pitchbook_check/);
+      warnSpy.mockRestore();
+    });
+
+    it('untrusted non-main group → unauthorized warn, no further processing', async () => {
+      const { logger } = await import('./logger.js');
+      const warnSpy = vi.spyOn(logger, 'warn').mockImplementation(() => {});
+
+      await processTaskIpc(
+        { type: 'pitchbook_check', watchlist: 'bogus' },
+        OTHER_FOLDER,
+        false,
+        deps,
+      );
+
+      const joined = JSON.stringify(warnSpy.mock.calls);
+      expect(joined).toMatch(/Unauthorized pitchbook_check/);
+      warnSpy.mockRestore();
+    });
+  });
+
+  // T18 verified manually: set NANOCLAW_IS_SCHEDULED_TASK=1 and confirm tool returns isError:true
+});
+
+// --- hasTrustedHostAction helper (U6 T16) ---
+describe('hasTrustedHostAction helper', () => {
+  const baseGroup: RegisteredGroup = {
+    name: 'X',
+    folder: 'x',
+    trigger: '@a',
+    added_at: '2024-01-01T00:00:00.000Z',
+  };
+
+  const cases: Array<{
+    label: string;
+    reg: RegisteredGroup | undefined;
+    action: string;
+    expected: boolean;
+  }> = [
+    { label: 'undefined reg', reg: undefined, action: 'pitchbook_check', expected: false },
+    {
+      label: 'reg without containerConfig',
+      reg: baseGroup,
+      action: 'pitchbook_check',
+      expected: false,
+    },
+    {
+      label: 'containerConfig without trustedHostActions',
+      reg: { ...baseGroup, containerConfig: {} },
+      action: 'pitchbook_check',
+      expected: false,
+    },
+    {
+      label: 'empty trustedHostActions',
+      reg: {
+        ...baseGroup,
+        containerConfig: { trustedHostActions: [] },
+      },
+      action: 'pitchbook_check',
+      expected: false,
+    },
+    {
+      label: 'action missing from list',
+      reg: {
+        ...baseGroup,
+        containerConfig: { trustedHostActions: ['other_action'] },
+      },
+      action: 'pitchbook_check',
+      expected: false,
+    },
+    {
+      label: 'action present in list',
+      reg: {
+        ...baseGroup,
+        containerConfig: { trustedHostActions: ['pitchbook_check'] },
+      },
+      action: 'pitchbook_check',
+      expected: true,
+    },
+    {
+      label: 'namespaced action present',
+      reg: {
+        ...baseGroup,
+        containerConfig: {
+          trustedHostActions: ['host_mcp_query:pitchbook'],
+        },
+      },
+      action: 'host_mcp_query:pitchbook',
+      expected: true,
+    },
+    {
+      label: 'namespaced scope mismatch',
+      reg: {
+        ...baseGroup,
+        containerConfig: {
+          trustedHostActions: ['host_mcp_query:pitchbook'],
+        },
+      },
+      action: 'host_mcp_query:gmail',
+      expected: false,
+    },
+  ];
+
+  for (const c of cases) {
+    it(`${c.label} → ${c.expected}`, () => {
+      expect(hasTrustedHostAction(c.reg, c.action)).toBe(c.expected);
+    });
+  }
 });

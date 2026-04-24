@@ -112,14 +112,26 @@ const HOST_MCP_REPLY_SERVER_CMD =
 const HOST_MCP_REPLY_SERVER_SCRIPT =
   process.env.HOST_MCP_REPLY_SERVER_SCRIPT || 'dist/host-mcp-reply-server.js';
 
-const hostMcpLastRun = new Map<string, number>(); // key: `${sourceGroup}:${scope}`
-const hostMcpActiveChildren = new Map<string, ChildProcess>(); // key: requestId
+// Exported for test access only (U6). Tests need to observe debounce stamping,
+// pre-populate the concurrency map, and reset between cases. Production code
+// paths do not read these exports.
+export const hostMcpLastRun = new Map<string, number>(); // key: `${sourceGroup}:${scope}`
+export const hostMcpActiveChildren = new Map<string, ChildProcess>(); // key: requestId
+
+// Test-only helper: clears module-scope host-MCP state so each test starts
+// from a clean slate. Safe to call from production code paths but intended
+// only for `beforeEach` in unit tests.
+export function _resetHostMcpState(): void {
+  hostMcpLastRun.clear();
+  hostMcpActiveChildren.clear();
+}
 
 // Returns true if the group is trusted to invoke the given action name.
 // Main groups bypass the trustedHostActions list (they're trusted by default).
 // Used by `pitchbook_check` (flat action name) and `host_mcp_query:<scope>`
-// (namespaced action name). Exported indirectly via consumers.
-function hasTrustedHostAction(
+// (namespaced action name). Exported for unit-test coverage of the authz
+// matrix (U6 T16); consumers in this file reference it directly.
+export function hasTrustedHostAction(
   reg: RegisteredGroup | undefined,
   action: string,
 ): boolean {

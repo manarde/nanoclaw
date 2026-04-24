@@ -104,6 +104,14 @@ const REQUEST_ID_PATTERN =
   /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/;
 const SCOPE_NAME_PATTERN = /^[a-z][a-z0-9_-]{0,31}$/;
 
+// The host-side reply MCP server (U8). `dist/host-mcp-reply-server.js` is the
+// normal prod path (daemon runs from `dist/`); dev or test harnesses can
+// override with HOST_MCP_REPLY_SERVER_CMD / HOST_MCP_REPLY_SERVER_SCRIPT.
+const HOST_MCP_REPLY_SERVER_CMD =
+  process.env.HOST_MCP_REPLY_SERVER_CMD || 'node';
+const HOST_MCP_REPLY_SERVER_SCRIPT =
+  process.env.HOST_MCP_REPLY_SERVER_SCRIPT || 'dist/host-mcp-reply-server.js';
+
 const hostMcpLastRun = new Map<string, number>(); // key: `${sourceGroup}:${scope}`
 const hostMcpActiveChildren = new Map<string, ChildProcess>(); // key: requestId
 
@@ -130,10 +138,7 @@ function synthesizeFailureReply(
 ): void {
   try {
     if (!isValidGroupFolder(sourceGroup) || !chatJid || !text) return;
-    const messagesDir = path.join(
-      resolveGroupIpcPath(sourceGroup),
-      'messages',
-    );
+    const messagesDir = path.join(resolveGroupIpcPath(sourceGroup), 'messages');
     fs.mkdirSync(messagesDir, { recursive: true });
     const filename = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}.json`;
     const filePath = path.join(messagesDir, filename);
@@ -861,11 +866,56 @@ export async function processTaskIpc(
         ...scopeDef.allowedToolPrefixes.map((p) => `${p}*`),
         'mcp__nanoclaw_host__host_mcp_reply',
       ].join(',');
+
+      // (8a) Per-spawn MCP config (U8). Registers the host-side reply MCP
+      //      server with `sourceGroup`, `chatJid`, and `requestId` baked into
+      //      its positional argv — the agent cannot override these since
+      //      they're argv to the server, not tool parameters. File is
+      //      unlinked alongside the request descriptor on child exit.
+      const mcpConfigPath = path.join(
+        hostMcpBase,
+        `${requestId}.mcp-config.json`,
+      );
+      if (!isWithinBase(hostMcpBase, mcpConfigPath)) {
+        reject('Invalid request identifier.');
+        break;
+      }
+      const mcpConfig = {
+        mcpServers: {
+          nanoclaw_host: {
+            command: HOST_MCP_REPLY_SERVER_CMD,
+            args: [
+              HOST_MCP_REPLY_SERVER_SCRIPT,
+              sourceGroup,
+              chatJid,
+              requestId,
+            ],
+          },
+        },
+      };
+      try {
+        writeHostMcpRequestFile(mcpConfigPath, mcpConfig);
+      } catch (err) {
+        try {
+          fs.unlinkSync(requestPath);
+        } catch {
+          /* ENOENT ok */
+        }
+        logger.error(
+          { err, requestId, scope, sourceGroup },
+          'host_mcp_query: failed to write MCP config file',
+        );
+        reject('Could not stage host-MCP request.');
+        break;
+      }
+
       const argv = [
         '-p',
         '--dangerously-skip-permissions',
         '--allowed-tools',
         allowedTools,
+        '--mcp-config',
+        mcpConfigPath,
         `/host-mcp-agent ${scope} ${sourceGroup} ${requestId}`,
       ];
 
@@ -887,6 +937,11 @@ export async function processTaskIpc(
         } catch {
           /* ENOENT ok */
         }
+        try {
+          fs.unlinkSync(mcpConfigPath);
+        } catch {
+          /* ENOENT ok */
+        }
         logger.error(
           { err, requestId, scope, sourceGroup },
           'host_mcp_query: spawn threw synchronously',
@@ -904,6 +959,11 @@ export async function processTaskIpc(
       child.on('error', (err) => {
         try {
           fs.unlinkSync(requestPath);
+        } catch {
+          /* ENOENT ok */
+        }
+        try {
+          fs.unlinkSync(mcpConfigPath);
         } catch {
           /* ENOENT ok */
         }
@@ -952,19 +1012,13 @@ export async function processTaskIpc(
         try {
           child.kill('SIGTERM');
         } catch (err) {
-          logger.warn(
-            { err, requestId },
-            'host_mcp_query: SIGTERM failed',
-          );
+          logger.warn({ err, requestId }, 'host_mcp_query: SIGTERM failed');
         }
         killTimer = setTimeout(() => {
           try {
             child.kill('SIGKILL');
           } catch (err) {
-            logger.warn(
-              { err, requestId },
-              'host_mcp_query: SIGKILL failed',
-            );
+            logger.warn({ err, requestId }, 'host_mcp_query: SIGKILL failed');
           }
         }, HOST_MCP_KILL_GRACE_MS);
       }, HOST_MCP_TIMEOUT_MS);
@@ -995,6 +1049,11 @@ export async function processTaskIpc(
           hostMcpActiveChildren.delete(requestId);
           try {
             fs.unlinkSync(requestPath);
+          } catch {
+            /* ENOENT ok — already gone */
+          }
+          try {
+            fs.unlinkSync(mcpConfigPath);
           } catch {
             /* ENOENT ok — already gone */
           }

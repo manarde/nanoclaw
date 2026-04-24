@@ -9,6 +9,7 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { z } from 'zod';
 import fs from 'fs';
 import path from 'path';
+import { randomUUID } from 'node:crypto';
 import { CronExpressionParser } from 'cron-parser';
 
 const IPC_DIR = '/workspace/ipc';
@@ -511,6 +512,66 @@ Debounced: a given watchlist can only be triggered once per 5 minutes.`,
         {
           type: 'text' as const,
           text: `PitchBook check requested for "${args.watchlist}". The host will run the check asynchronously and post any alerts/digests to the watchlist's configured channel.`,
+        },
+      ],
+    };
+  },
+);
+
+server.tool(
+  'run_host_mcp_query',
+  `Dispatch a free-form natural-language question to a scope-constrained host-side MCP (e.g., PitchBook). The host agent answers using only the tools inside that scope and delivers the reply as a separate chat message.
+
+Use when the user asks for a free-form PitchBook lookup, profile, portfolio, or report query; see skill \`pitchbook\` for trigger patterns.
+
+After calling this tool, briefly acknowledge to the user and end your turn immediately. Do NOT wait for the answer — it arrives as a separate chat message. Do NOT retry the tool while waiting — duplicate dispatch is rejected by debounce.`,
+  {
+    scope: z
+      .string()
+      .regex(/^[a-z][a-z0-9_-]{0,31}$/)
+      .describe(
+        'Scope name that selects the host-side MCP tool set (e.g., "pitchbook"). Lowercase alnum/underscore/hyphen, 1-32 chars, must start with a letter.',
+      ),
+    question: z
+      .string()
+      .min(1)
+      .max(4000)
+      .describe(
+        'Natural-language question the host agent will answer using only tools in the given scope. Include all routing context in the text — the host composes tool calls dynamically.',
+      ),
+  },
+  async (args) => {
+    if (process.env.NANOCLAW_IS_SCHEDULED_TASK === '1') {
+      return {
+        content: [
+          {
+            type: 'text' as const,
+            text: 'Error: run_host_mcp_query is not available in scheduled-task context. User-triggered only.',
+          },
+        ],
+        isError: true,
+      };
+    }
+
+    const requestId = randomUUID();
+
+    const data = {
+      type: 'host_mcp_query',
+      scope: args.scope,
+      question: args.question,
+      requestId,
+      groupFolder,
+      chatJid,
+      timestamp: new Date().toISOString(),
+    };
+
+    writeIpcFile(TASKS_DIR, data);
+
+    return {
+      content: [
+        {
+          type: 'text' as const,
+          text: `Dispatched ${args.scope} query. Answer follows as a separate message. **End your turn now — do not wait or retry.**`,
         },
       ],
     };

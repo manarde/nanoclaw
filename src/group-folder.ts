@@ -21,9 +21,13 @@ export function assertValidGroupFolder(folder: string): void {
   }
 }
 
-function ensureWithinBase(baseDir: string, resolvedPath: string): void {
+export function isWithinBase(baseDir: string, resolvedPath: string): boolean {
   const rel = path.relative(baseDir, resolvedPath);
-  if (rel.startsWith('..') || path.isAbsolute(rel)) {
+  return !rel.startsWith('..') && !path.isAbsolute(rel);
+}
+
+function ensureWithinBase(baseDir: string, resolvedPath: string): void {
+  if (!isWithinBase(baseDir, resolvedPath)) {
     throw new Error(`Path escapes base directory: ${resolvedPath}`);
   }
 }

@@ -64,6 +64,12 @@ beforeEach(() => {
     getAvailableGroups: () => [],
     writeGroupsSnapshot: () => {},
     onTasksChanged: () => {},
+    // U1 added a spawn seam for host-MCP proxy. Existing authz tests don't
+    // exercise the `host_mcp_query` case so the stub never runs; U6 will
+    // swap in a proper vi.fn for the host_mcp_query test block.
+    spawnHostClaude: () => {
+      throw new Error('spawnHostClaude stub not configured for this test');
+    },
   };
 });
 

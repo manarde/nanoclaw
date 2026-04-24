@@ -1,3 +1,4 @@
+import { spawn } from 'child_process';
 import fs from 'fs';
 import path from 'path';
 
@@ -792,6 +793,12 @@ async function main(): Promise<void> {
     getAvailableGroups,
     writeGroupsSnapshot: (gf, im, ag, rj) =>
       writeGroupsSnapshot(gf, im, ag, rj),
+    // Default spawn seam for host-side `claude -p` sessions (host-MCP proxy).
+    // Tests override this to stub out the child-process dependency.
+    spawnHostClaude: (argv, opts) => {
+      const bin = process.env.CLAUDE_BIN || 'claude';
+      return spawn(bin, argv, opts);
+    },
     onTasksChanged: () => {
       const tasks = getAllTasks();
       const taskRows = tasks.map((t) => ({

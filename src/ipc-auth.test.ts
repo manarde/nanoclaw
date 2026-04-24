@@ -890,7 +890,10 @@ describe('host_mcp_query authorization', () => {
   });
 
   // ---- T3: shape-invalid inputs (table-driven) ----------------------------
-  const shapeInvalidRows: Array<{ label: string; override: Record<string, unknown> }> = [
+  const shapeInvalidRows: Array<{
+    label: string;
+    override: Record<string, unknown>;
+  }> = [
     { label: 'scope with space', override: { scope: 'foo bar' } },
     { label: 'scope with path escape', override: { scope: '../x' } },
     { label: 'scope __proto__', override: { scope: '__proto__' } },
@@ -909,12 +912,7 @@ describe('host_mcp_query authorization', () => {
 
   for (const row of shapeInvalidRows) {
     it(`T3 (${row.label}): no spawn + decline reply written`, async () => {
-      await processTaskIpc(
-        validPayload(row.override),
-        MAIN_FOLDER,
-        true,
-        deps,
-      );
+      await processTaskIpc(validPayload(row.override), MAIN_FOLDER, true, deps);
 
       expect(spawnStub).not.toHaveBeenCalled();
       const files = listMessageFiles(MAIN_FOLDER);
@@ -1075,11 +1073,9 @@ describe('host_mcp_query authorization', () => {
 
     // Stub logger.info on the exit-log call to throw
     const { logger } = await import('./logger.js');
-    const infoSpy = vi
-      .spyOn(logger, 'info')
-      .mockImplementation(() => {
-        throw new Error('logger blew up');
-      });
+    const infoSpy = vi.spyOn(logger, 'info').mockImplementation(() => {
+      throw new Error('logger blew up');
+    });
 
     // Emit 'exit' — the handler wraps logging in try/finally
     // so the finally block still unlinks the request file and drops the child.
@@ -1156,7 +1152,8 @@ describe('host_mcp_query authorization', () => {
       const messages = warnSpy.mock.calls.map((c) =>
         typeof c[1] === 'string' ? c[1] : (c[0] as { msg?: string }).msg || '',
       );
-      const joined = messages.join('|') + '|' + JSON.stringify(warnSpy.mock.calls);
+      const joined =
+        messages.join('|') + '|' + JSON.stringify(warnSpy.mock.calls);
       expect(joined).toMatch(/watchlist not found|invalid watchlist slug/i);
       expect(joined).not.toMatch(/Unauthorized pitchbook_check/);
       warnSpy.mockRestore();
@@ -1223,7 +1220,12 @@ describe('hasTrustedHostAction helper', () => {
     action: string;
     expected: boolean;
   }> = [
-    { label: 'undefined reg', reg: undefined, action: 'pitchbook_check', expected: false },
+    {
+      label: 'undefined reg',
+      reg: undefined,
+      action: 'pitchbook_check',
+      expected: false,
+    },
     {
       label: 'reg without containerConfig',
       reg: baseGroup,

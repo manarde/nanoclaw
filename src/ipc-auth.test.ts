@@ -748,6 +748,19 @@ function cleanGroupIpc(folder: string): void {
   }
 }
 
+// FIX 1: per-spawn .mcp-config.json files now live outside any group's IPC
+// dir so they can't be raced by a container. Wipe between tests for isolation.
+function cleanHostMcpConfigs(): void {
+  try {
+    fs.rmSync(path.join(DATA_DIR, 'host-mcp-configs'), {
+      recursive: true,
+      force: true,
+    });
+  } catch {
+    /* best-effort */
+  }
+}
+
 // Returns the list of message files written to data/ipc/<folder>/messages/
 function listMessageFiles(folder: string): string[] {
   const dir = path.join(DATA_DIR, 'ipc', folder, 'messages');
@@ -791,6 +804,7 @@ describe('host_mcp_query authorization', () => {
     cleanGroupIpc(MAIN_FOLDER);
     cleanGroupIpc(OTHER_FOLDER);
     cleanGroupIpc('third-group');
+    cleanHostMcpConfigs();
     fakeChild = makeFakeChild();
     spawnStub = vi.fn(() => fakeChild);
     deps.spawnHostClaude = spawnStub as unknown as IpcDeps['spawnHostClaude'];
@@ -801,6 +815,7 @@ describe('host_mcp_query authorization', () => {
     cleanGroupIpc(MAIN_FOLDER);
     cleanGroupIpc(OTHER_FOLDER);
     cleanGroupIpc('third-group');
+    cleanHostMcpConfigs();
     vi.useRealTimers();
     vi.restoreAllMocks();
   });
@@ -845,6 +860,29 @@ describe('host_mcp_query authorization', () => {
       sourceGroup: MAIN_FOLDER,
       scope: 'pitchbook',
     });
+
+    // FIX 1: MCP config lives in host-only data/host-mcp-configs/, NOT in
+    // the container-mounted host-mcp-requests/. Verify both: present in
+    // host-only dir, absent from the mounted dir.
+    const mcpConfigHostPath = path.join(
+      DATA_DIR,
+      'host-mcp-configs',
+      `${VALID_REQUEST_ID}.mcp-config.json`,
+    );
+    expect(fs.existsSync(mcpConfigHostPath)).toBe(true);
+    const mcpConfigInMountedPath = path.join(
+      DATA_DIR,
+      'ipc',
+      MAIN_FOLDER,
+      'host-mcp-requests',
+      `${VALID_REQUEST_ID}.mcp-config.json`,
+    );
+    expect(fs.existsSync(mcpConfigInMountedPath)).toBe(false);
+
+    // FIX 1: spawn argv should reference the host-only mcp-config path.
+    const mcpConfigIdx = argv.indexOf('--mcp-config');
+    expect(mcpConfigIdx).toBeGreaterThanOrEqual(0);
+    expect(argv[mcpConfigIdx + 1]).toBe(mcpConfigHostPath);
 
     // Debounce NOT stamped until 'spawn' event fires
     expect(hostMcpLastRun.has(`${MAIN_FOLDER}:pitchbook`)).toBe(false);
@@ -1068,7 +1106,13 @@ describe('host_mcp_query authorization', () => {
       'host-mcp-requests',
       `${VALID_REQUEST_ID}.json`,
     );
+    const mcpConfigPath = path.join(
+      DATA_DIR,
+      'host-mcp-configs',
+      `${VALID_REQUEST_ID}.mcp-config.json`,
+    );
     expect(fs.existsSync(requestPath)).toBe(true);
+    expect(fs.existsSync(mcpConfigPath)).toBe(true);
     expect(hostMcpActiveChildren.has(VALID_REQUEST_ID)).toBe(true);
 
     // Stub logger.info on the exit-log call to throw
@@ -1088,6 +1132,7 @@ describe('host_mcp_query authorization', () => {
 
     expect(hostMcpActiveChildren.has(VALID_REQUEST_ID)).toBe(false);
     expect(fs.existsSync(requestPath)).toBe(false);
+    expect(fs.existsSync(mcpConfigPath)).toBe(false);
     infoSpy.mockRestore();
   });
 

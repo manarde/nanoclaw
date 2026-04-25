@@ -118,6 +118,24 @@ const HOST_MCP_REPLY_SERVER_SCRIPT =
 export const hostMcpLastRun = new Map<string, number>(); // key: `${sourceGroup}:${scope}`
 export const hostMcpActiveChildren = new Map<string, ChildProcess>(); // key: requestId
 
+// Host-only directory for per-spawn `.mcp-config.json` files. NOT bind-mounted
+// into any container (verified in `src/container-runner.ts` — only
+// `host-mcp-requests/` is mounted). The MCP config registers the host-side
+// reply server with `sourceGroup`/`chatJid`/`requestId` baked into argv; if a
+// container could overwrite this file it could inject arbitrary `mcpServers`
+// entries and achieve host code execution. Keeping the config outside the
+// container's filesystem namespace eliminates that race.
+const HOST_MCP_CONFIG_DIR = path.join(DATA_DIR, 'host-mcp-configs');
+
+function ensureHostMcpConfigDir(): void {
+  fs.mkdirSync(HOST_MCP_CONFIG_DIR, { recursive: true });
+  try {
+    fs.chmodSync(HOST_MCP_CONFIG_DIR, 0o700);
+  } catch {
+    /* best-effort — chmod can fail on some filesystems (e.g. CI tmpfs) */
+  }
+}
+
 // Test-only helper: clears module-scope host-MCP state so each test starts
 // from a clean slate. Safe to call from production code paths but intended
 // only for `beforeEach` in unit tests.
@@ -884,11 +902,26 @@ export async function processTaskIpc(
       //      its positional argv — the agent cannot override these since
       //      they're argv to the server, not tool parameters. File is
       //      unlinked alongside the request descriptor on child exit.
+      //
+      //      SECURITY: this config lives in `data/host-mcp-configs/` which is
+      //      NOT bind-mounted into any container (see `src/container-runner.ts`).
+      //      A prompt-injected container CANNOT race-overwrite this file to
+      //      inject malicious `mcpServers` entries — the path is outside the
+      //      container's filesystem namespace. The request descriptor
+      //      (`<id>.json`) stays inside `host-mcp-requests/` because the host
+      //      skill reads it from there; only the authority-bearing config is
+      //      moved.
+      ensureHostMcpConfigDir();
       const mcpConfigPath = path.join(
-        hostMcpBase,
+        HOST_MCP_CONFIG_DIR,
         `${requestId}.mcp-config.json`,
       );
-      if (!isWithinBase(hostMcpBase, mcpConfigPath)) {
+      if (!isWithinBase(HOST_MCP_CONFIG_DIR, mcpConfigPath)) {
+        try {
+          fs.unlinkSync(requestPath);
+        } catch {
+          /* ENOENT ok */
+        }
         reject('Invalid request identifier.');
         break;
       }

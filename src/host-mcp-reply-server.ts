@@ -105,15 +105,18 @@ export function writeIpcMessageFile(
  * Exported so unit tests can exercise the write path without the MCP wire
  * protocol.
  *
- * Tracks call count for logging — multiple replies per request are unusual
- * but not a security issue (each one is pinned to the same chatJid), so
- * subsequent calls log a warning and still deliver.
+ * Enforces single-reply semantics: the first call writes a message file and
+ * returns success; subsequent calls return `isError: true` and write nothing.
+ * Without this guard a prompt-injected agent could call the tool repeatedly
+ * to spam the user's chat with N copies of the same reply (each pinned to
+ * the correct chatJid by argv, so not a security boundary, but a UX abuse).
  */
-export function buildHostMcpReplyHandler(
-  ctx: HostMcpReplyContext,
-): (args: {
+export function buildHostMcpReplyHandler(ctx: HostMcpReplyContext): (args: {
   text: string;
-}) => Promise<{ content: Array<{ type: 'text'; text: string }> }> {
+}) => Promise<{
+  content: Array<{ type: 'text'; text: string }>;
+  isError?: boolean;
+}> {
   assertValidContext(ctx);
   let callCount = 0;
 
@@ -122,8 +125,17 @@ export function buildHostMcpReplyHandler(
     if (callCount > 1) {
       // eslint-disable-next-line no-console
       console.warn(
-        `[host-mcp-reply-server] requestId=${ctx.requestId} received ${callCount} replies (unusual but allowed)`,
+        `[host-mcp-reply-server] requestId=${ctx.requestId} attempted ${callCount} replies; rejecting subsequent call`,
       );
+      return {
+        content: [
+          {
+            type: 'text' as const,
+            text: 'host_mcp_reply already called for this request. Reply was delivered. Exit.',
+          },
+        ],
+        isError: true,
+      };
     }
 
     const messagesDir = path.join(

@@ -66,29 +66,35 @@ describe('host_mcp_reply (T13 — happy path)', () => {
     expect(typeof payload.timestamp).toBe('string');
   });
 
-  it('allows multiple replies (unusual but not a security issue)', async () => {
+  it('FIX 4: rejects second+ calls — exactly one message file, second call returns isError', async () => {
     const handler = buildHostMcpReplyHandler({
       sourceGroup: testGroup,
       chatJid: validChatJid,
       requestId: validRequestId,
     });
 
-    await handler({ text: 'first' });
-    await handler({ text: 'second' });
+    const first = await handler({ text: 'first' });
+    expect(first.isError).toBeFalsy();
+    expect(first.content[0]).toEqual({ type: 'text', text: 'Reply delivered.' });
 
+    const second = await handler({ text: 'second-attempt-spam' });
+    expect(second.isError).toBe(true);
+    expect(second.content[0].text).toMatch(/already called/i);
+
+    const third = await handler({ text: 'third-attempt-spam' });
+    expect(third.isError).toBe(true);
+
+    // Only the first call wrote a file.
     const messagesDir = path.join(resolveGroupIpcPath(testGroup), 'messages');
     const files = fs
       .readdirSync(messagesDir)
       .filter((f) => f.endsWith('.json'));
-    expect(files).toHaveLength(2);
+    expect(files).toHaveLength(1);
 
-    const texts = files
-      .map(
-        (f) =>
-          JSON.parse(fs.readFileSync(path.join(messagesDir, f), 'utf-8')).text,
-      )
-      .sort();
-    expect(texts).toEqual(['first', 'second']);
+    const payload = JSON.parse(
+      fs.readFileSync(path.join(messagesDir, files[0]), 'utf-8'),
+    );
+    expect(payload.text).toBe('first');
   });
 
   it('rejects invalid argv shapes at context construction', () => {

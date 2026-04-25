@@ -884,9 +884,7 @@ describe('host_mcp_query authorization', () => {
     expect(mcpConfigIdx).toBeGreaterThanOrEqual(0);
     expect(argv[mcpConfigIdx + 1]).toBe(mcpConfigHostPath);
 
-    // Debounce NOT stamped until 'spawn' event fires
-    expect(hostMcpLastRun.has(`${MAIN_FOLDER}:pitchbook`)).toBe(false);
-    fakeChild.emit('spawn');
+    // FIX 3: debounce is stamped SYNCHRONOUSLY, before any 'spawn' event.
     expect(hostMcpLastRun.has(`${MAIN_FOLDER}:pitchbook`)).toBe(true);
 
     // Child is tracked for concurrency accounting
@@ -1027,8 +1025,8 @@ describe('host_mcp_query authorization', () => {
     // First dispatch — happy path
     await processTaskIpc(validPayload(), MAIN_FOLDER, true, deps);
     expect(spawnStub).toHaveBeenCalledTimes(1);
-    // Stamp debounce by emitting spawn
-    fakeChild.emit('spawn');
+    // FIX 3: debounce is stamped synchronously after spawn returns; no
+    // 'spawn' event needed.
     expect(hostMcpLastRun.has(`${MAIN_FOLDER}:pitchbook`)).toBe(true);
 
     // Second dispatch with same key → declined
@@ -1063,6 +1061,27 @@ describe('host_mcp_query authorization', () => {
     expect(spawnStub).toHaveBeenCalledTimes(2);
   });
 
+  // ---- T7b (FIX 3): same-tick burst — debounce stamps synchronously ------
+  it('T7b: two same-{group,scope} task files dispatched back-to-back in the same tick → only first spawns', async () => {
+    // Two awaited calls in immediate succession. Before FIX 3 the debounce
+    // stamp was deferred to the async 'spawn' event, so both calls passed
+    // the gate. After FIX 3 the stamp is synchronous and the second call
+    // is rejected with "too fast".
+    await processTaskIpc(validPayload(), MAIN_FOLDER, true, deps);
+    await processTaskIpc(
+      validPayload({ requestId: SECOND_REQUEST_ID }),
+      MAIN_FOLDER,
+      true,
+      deps,
+    );
+
+    expect(spawnStub).toHaveBeenCalledTimes(1);
+    const files = listMessageFiles(MAIN_FOLDER);
+    expect(files).toHaveLength(1);
+    const payload = readFirstMessageFile(MAIN_FOLDER)!;
+    expect(payload.text).toMatch(/too fast/i);
+  });
+
   // ---- T8: path-escape via isWithinBase -----------------------------------
   //
   // Note: mocking `isWithinBase` would require `vi.mock('./group-folder.js')`
@@ -1074,26 +1093,76 @@ describe('host_mcp_query authorization', () => {
     expect(true).toBe(true);
   });
 
-  // ---- T9: spawn failure cleanup -----------------------------------------
-  it('T9: spawn emits error → request file unlinked, decline reply, debounce NOT stamped', async () => {
+  // ---- T9 (FIX 2): spawn-error path performs full cleanup ----------------
+  it('T9: spawn emits error → request + mcp-config unlinked, decline reply, debounce rolled back, map entry cleared, timers cleared, no later spurious timeout reply', async () => {
+    vi.useFakeTimers();
+    try {
+      await processTaskIpc(validPayload(), MAIN_FOLDER, true, deps);
+
+      const requestPath = path.join(
+        DATA_DIR,
+        'ipc',
+        MAIN_FOLDER,
+        'host-mcp-requests',
+        `${VALID_REQUEST_ID}.json`,
+      );
+      const mcpConfigPath = path.join(
+        DATA_DIR,
+        'host-mcp-configs',
+        `${VALID_REQUEST_ID}.mcp-config.json`,
+      );
+      expect(fs.existsSync(requestPath)).toBe(true);
+      expect(fs.existsSync(mcpConfigPath)).toBe(true);
+      // FIX 3: debounce stamped synchronously on successful spawn.
+      expect(hostMcpLastRun.has(`${MAIN_FOLDER}:pitchbook`)).toBe(true);
+      // FIX 2: child was registered for concurrency accounting.
+      expect(hostMcpActiveChildren.has(VALID_REQUEST_ID)).toBe(true);
+      // softTimer was scheduled.
+      expect(vi.getTimerCount()).toBeGreaterThanOrEqual(1);
+
+      // Simulate async spawn failure (e.g., ENOENT post-fork).
+      fakeChild.emit('error', new Error('ENOENT: claude binary'));
+
+      // FIX 1+2: both authority files unlinked.
+      expect(fs.existsSync(requestPath)).toBe(false);
+      expect(fs.existsSync(mcpConfigPath)).toBe(false);
+
+      // Decline reply written.
+      const payload = readFirstMessageFile(MAIN_FOLDER)!;
+      expect(payload.text).toMatch(/could not start/i);
+
+      // FIX 2: debounce rolled back so a failed spawn doesn't burn the user's
+      // budget.
+      expect(hostMcpLastRun.has(`${MAIN_FOLDER}:pitchbook`)).toBe(false);
+      // FIX 2: map entry cleared so concurrency cap isn't leaked.
+      expect(hostMcpActiveChildren.has(VALID_REQUEST_ID)).toBe(false);
+      // FIX 2: softTimer (and killTimer if scheduled) cleared.
+      expect(vi.getTimerCount()).toBe(0);
+
+      // FIX 2: advancing past the timeout window should NOT produce a
+      // spurious second reply, since softTimer was cleared.
+      const messagesBefore = listMessageFiles(MAIN_FOLDER).length;
+      vi.advanceTimersByTime(120_000 + 5_000 + 1_000);
+      const messagesAfter = listMessageFiles(MAIN_FOLDER).length;
+      expect(messagesAfter).toBe(messagesBefore);
+      expect(fakeChild.kill).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  // ---- T9b (FIX 2): cleanup is idempotent across error→exit race ---------
+  it('T9b: error followed by exit → cleanup idempotent (no double unlink, no double map churn)', async () => {
     await processTaskIpc(validPayload(), MAIN_FOLDER, true, deps);
+    fakeChild.emit('error', new Error('ENOENT'));
+    expect(hostMcpActiveChildren.has(VALID_REQUEST_ID)).toBe(false);
 
-    const requestPath = path.join(
-      DATA_DIR,
-      'ipc',
-      MAIN_FOLDER,
-      'host-mcp-requests',
-      `${VALID_REQUEST_ID}.json`,
-    );
-    expect(fs.existsSync(requestPath)).toBe(true);
-
-    // Simulate async spawn failure before 'spawn' fires
-    fakeChild.emit('error', new Error('ENOENT: claude binary'));
-
-    expect(fs.existsSync(requestPath)).toBe(false);
-    const payload = readFirstMessageFile(MAIN_FOLDER)!;
-    expect(payload.text).toMatch(/could not start/i);
-    expect(hostMcpLastRun.has(`${MAIN_FOLDER}:pitchbook`)).toBe(false);
+    // Now also fire 'exit' — must not throw, must not write a duplicate
+    // request file or change cleanup state.
+    expect(() => fakeChild.emit('exit', 1, null)).not.toThrow();
+    expect(hostMcpActiveChildren.has(VALID_REQUEST_ID)).toBe(false);
+    // Still only the one decline reply — exit didn't add anything.
+    expect(listMessageFiles(MAIN_FOLDER)).toHaveLength(1);
   });
 
   // ---- T10: exit cleanup runs even if logger throws ----------------------

@@ -995,34 +995,12 @@ export async function processTaskIpc(
         break;
       }
 
-      // (9) Confirm spawn success before stamping debounce. `spawn` fires
-      //     once the OS has accepted the fork/exec; `error` covers the
-      //     async failure case (ENOENT, EPERM, etc).
-      child.on('spawn', () => {
-        hostMcpLastRun.set(debounceKey, Date.now());
-      });
-      child.on('error', (err) => {
-        try {
-          fs.unlinkSync(requestPath);
-        } catch {
-          /* ENOENT ok */
-        }
-        try {
-          fs.unlinkSync(mcpConfigPath);
-        } catch {
-          /* ENOENT ok */
-        }
-        logger.error(
-          { err, requestId, scope, sourceGroup },
-          'host_mcp_query: spawn failure',
-        );
-        synthesizeFailureReply(
-          sourceGroup,
-          chatJid,
-          'Could not start host-MCP query.',
-        );
-        // Do NOT stamp debounce on spawn failure.
-      });
+      // (9) Stamp debounce SYNCHRONOUSLY now that spawn has returned without
+      //     throwing. The IPC watcher serializes task processing, but each
+      //     handler returns before any 'spawn' event fires — stamping in the
+      //     async event handler would let bursts up to the concurrency cap
+      //     ALL bypass debounce. The 'error' path below rolls this back.
+      hostMcpLastRun.set(debounceKey, Date.now());
 
       // (10) Track the child for concurrency accounting and timeout cleanup.
       hostMcpActiveChildren.set(requestId, child);
@@ -1047,8 +1025,13 @@ export async function processTaskIpc(
       // (12) Two-step timeout: SIGTERM first, then SIGKILL after a grace
       //      window. The soft timer also synthesizes the timeout reply so
       //      the user sees a message even if the child exits cleanly after.
+      //      Declared before the 'error' listener so its cleanup branch can
+      //      reference them; `cleanedUp` makes cleanup idempotent across the
+      //      'error' / 'exit' race (per Node semantics, 'exit' may or may
+      //      not fire after 'error').
+      let cleanedUp = false;
       let killTimer: NodeJS.Timeout | undefined;
-      const softTimer = setTimeout(() => {
+      const softTimer: NodeJS.Timeout = setTimeout(() => {
         synthesizeFailureReply(
           sourceGroup,
           chatJid,
@@ -1068,9 +1051,56 @@ export async function processTaskIpc(
         }, HOST_MCP_KILL_GRACE_MS);
       }, HOST_MCP_TIMEOUT_MS);
 
-      // (13) Exit cleanup. try/finally ensures the map entry and request
+      const performCleanup = (): void => {
+        if (cleanedUp) return;
+        cleanedUp = true;
+        clearTimeout(softTimer);
+        if (killTimer) clearTimeout(killTimer);
+        hostMcpActiveChildren.delete(requestId);
+        try {
+          fs.unlinkSync(requestPath);
+        } catch {
+          /* ENOENT ok — already gone */
+        }
+        try {
+          fs.unlinkSync(mcpConfigPath);
+        } catch {
+          /* ENOENT ok — already gone */
+        }
+      };
+
+      // (13) Async spawn failure (e.g. ENOENT after fork). Per Node semantics
+      //      'exit' may not fire after 'error', so this handler must perform
+      //      full cleanup itself: clear timers, drop the map entry, unlink
+      //      both files, and roll back the debounce stamp so the failed
+      //      spawn doesn't consume the user's debounce budget. `cleanedUp`
+      //      guards against the race where 'exit' fires later anyway.
+      child.on('error', (err) => {
+        if (cleanedUp) {
+          logger.warn(
+            { err, requestId },
+            'host_mcp_query: error after cleanup (ignored)',
+          );
+          return;
+        }
+        hostMcpLastRun.delete(debounceKey);
+        performCleanup();
+        logger.error(
+          { err, requestId, scope, sourceGroup },
+          'host_mcp_query: spawn failure',
+        );
+        synthesizeFailureReply(
+          sourceGroup,
+          chatJid,
+          'Could not start host-MCP query.',
+        );
+      });
+
+      // (14) Exit cleanup. try/finally ensures the map entry and request
       //      file are cleaned up even if logger throws. Do NOT synthesize
       //      a success reply — that's the host_mcp_reply tool's job (U8).
+      //      `performCleanup` is idempotent against the 'error'-then-'exit'
+      //      race.
       const spawnedAt = Date.now();
       child.on('exit', (code, signal) => {
         try {
@@ -1089,19 +1119,7 @@ export async function processTaskIpc(
             'host_mcp_query exit',
           );
         } finally {
-          clearTimeout(softTimer);
-          if (killTimer) clearTimeout(killTimer);
-          hostMcpActiveChildren.delete(requestId);
-          try {
-            fs.unlinkSync(requestPath);
-          } catch {
-            /* ENOENT ok — already gone */
-          }
-          try {
-            fs.unlinkSync(mcpConfigPath);
-          } catch {
-            /* ENOENT ok — already gone */
-          }
+          performCleanup();
         }
       });
       break;

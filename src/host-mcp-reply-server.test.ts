@@ -75,7 +75,10 @@ describe('host_mcp_reply (T13 — happy path)', () => {
 
     const first = await handler({ text: 'first' });
     expect(first.isError).toBeFalsy();
-    expect(first.content[0]).toEqual({ type: 'text', text: 'Reply delivered.' });
+    expect(first.content[0]).toEqual({
+      type: 'text',
+      text: 'Reply delivered.',
+    });
 
     const second = await handler({ text: 'second-attempt-spam' });
     expect(second.isError).toBe(true);

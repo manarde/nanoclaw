@@ -46,7 +46,7 @@ import {
 } from './db.js';
 import { GroupQueue } from './group-queue.js';
 import { resolveGroupFolderPath } from './group-folder.js';
-import { startIpcWatcher } from './ipc.js';
+import { hostMcpActiveChildren, startIpcWatcher } from './ipc.js';
 import {
   findChannel,
   formatMessages,
@@ -640,6 +640,39 @@ async function main(): Promise<void> {
     logger.info({ signal }, 'Shutdown signal received');
     await queue.shutdown(10000);
     for (const ch of channels) await ch.disconnect();
+
+    // FIX 5: terminate any in-flight host-MCP `claude -p` children. Without
+    // this, on SIGTERM/SIGINT the daemon exits while these children are
+    // still running; their per-child exit handler in src/ipc.ts never fires,
+    // so request descriptor + .mcp-config files persist as orphans AND an
+    // orphaned claude can still write a reply via host-mcp-reply-server
+    // after a daemon restart (late/duplicate user messages, possibly to
+    // the wrong chat if registered_groups changed). Best-effort: SIGTERM,
+    // brief grace, then SIGKILL — mirrors the per-request kill timing in
+    // src/ipc.ts.
+    if (hostMcpActiveChildren.size > 0) {
+      logger.info(
+        { count: hostMcpActiveChildren.size },
+        'Terminating in-flight host-MCP children',
+      );
+      for (const child of hostMcpActiveChildren.values()) {
+        try {
+          child.kill('SIGTERM');
+        } catch {
+          /* best-effort */
+        }
+      }
+      await new Promise((r) => setTimeout(r, 2000));
+      for (const child of hostMcpActiveChildren.values()) {
+        try {
+          child.kill('SIGKILL');
+        } catch {
+          /* best-effort */
+        }
+      }
+      hostMcpActiveChildren.clear();
+    }
+
     process.exit(0);
   };
   process.on('SIGTERM', () => shutdown('SIGTERM'));

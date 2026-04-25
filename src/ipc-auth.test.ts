@@ -884,6 +884,25 @@ describe('host_mcp_query authorization', () => {
     expect(mcpConfigIdx).toBeGreaterThanOrEqual(0);
     expect(argv[mcpConfigIdx + 1]).toBe(mcpConfigHostPath);
 
+    // OPTION C: built-in tools hard-denied via `--tools ""`.
+    const toolsIdx = argv.indexOf('--tools');
+    expect(toolsIdx).toBeGreaterThanOrEqual(0);
+    expect(argv[toolsIdx + 1]).toBe('');
+
+    // OPTION C: third-party MCPs outside the scope are explicitly denied.
+    // Pitchbook is in-scope and MUST NOT appear; Gmail/Drive/Calendar/etc.
+    // MUST appear in the denylist.
+    const disallowedIdx = argv.indexOf('--disallowed-tools');
+    expect(disallowedIdx).toBeGreaterThanOrEqual(0);
+    const disallowed = argv[disallowedIdx + 1];
+    expect(disallowed).not.toContain('mcp__claude_ai_PitchBook_Premium__');
+    expect(disallowed).toContain('mcp__claude_ai_Gmail__*');
+    expect(disallowed).toContain('mcp__claude_ai_Google_Drive__*');
+    expect(disallowed).toContain('mcp__claude_ai_Google_Calendar__*');
+    expect(disallowed).toContain('mcp__claude_ai_Google_Cloud_BigQuery__*');
+    expect(disallowed).toContain('mcp__claude_ai_Clay__*');
+    expect(disallowed).toContain('mcp__claude_ai_PowerNotes__*');
+
     // FIX 3: debounce is stamped SYNCHRONOUSLY, before any 'spawn' event.
     expect(hostMcpLastRun.has(`${MAIN_FOLDER}:pitchbook`)).toBe(true);
 

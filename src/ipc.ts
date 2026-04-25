@@ -93,6 +93,35 @@ const HOST_MCP_SCOPES: Record<string, { allowedToolPrefixes: string[] }> = {
   },
 };
 
+// Known third-party MCP prefixes available on this host's user-scope claude
+// config. The host-mcp-agent runs under the daemon's $HOME, so it inherits
+// EVERY MCP the user has configured. The claude CLI's `--allowed-tools` flag
+// behaves as an auto-approve hint rather than a hard allowlist for MCP tools,
+// so a prompt-injected scope query can still reach unrelated MCPs (Gmail send,
+// Drive create, Calendar invite, etc.) and execute on Matt's behalf.
+//
+// Defense in depth (Option C):
+//   1. `--tools ""` hard-denies all built-in tools (Bash/Read/Edit/Write/...).
+//      The host skill only needs MCP tools, so this is safe.
+//   2. `--disallowed-tools` enumerates every known third-party MCP prefix that
+//      is NOT in the current scope's allowlist, blocking cross-pollination.
+//
+// MAINTENANCE: when Matt adds a new user-scope MCP via `claude mcp add ...`,
+// add its prefix here, otherwise the host-mcp-agent will be able to reach it
+// from any scope. Stronger long-term fix: switch to `--strict-mcp-config` and
+// register the scope's MCP server explicitly in our per-spawn `.mcp-config.json`
+// — that eliminates the inherited-config blast radius entirely. See
+// `docs/plans/2026-04-24-001-feat-host-mcp-proxy-plan.md` risk table.
+const KNOWN_HOST_MCP_PREFIXES = [
+  'mcp__claude_ai_PitchBook_Premium__',
+  'mcp__claude_ai_Gmail__',
+  'mcp__claude_ai_Google_Calendar__',
+  'mcp__claude_ai_Google_Cloud_BigQuery__',
+  'mcp__claude_ai_Google_Drive__',
+  'mcp__claude_ai_Clay__',
+  'mcp__claude_ai_PowerNotes__',
+];
+
 const HOST_MCP_DEBOUNCE_MS = 30_000;
 const HOST_MCP_TIMEOUT_MS = 120_000;
 const HOST_MCP_KILL_GRACE_MS = 5_000;
@@ -887,15 +916,25 @@ export async function processTaskIpc(
         break;
       }
 
-      // (8) Spawn the host-side claude with a locked-down tool allowlist.
-      //     The scope's allowed prefixes are suffixed with `*` so they match
-      //     any tool in that MCP server; the reply primitive (U8) is the
-      //     only write path the agent has.
+      // (8) Spawn the host-side claude with a locked-down tool allowlist
+      //     plus an explicit denylist for every other known host MCP. See
+      //     KNOWN_HOST_MCP_PREFIXES for the rationale (Option C: partial
+      //     sandbox + explicit MCP denylist). The scope's allowed prefixes
+      //     are suffixed with `*` so they match any tool in that MCP server;
+      //     the reply primitive (U8) is the only write path the agent has.
       const scopeDef = HOST_MCP_SCOPES[scope];
       const allowedTools = [
         ...scopeDef.allowedToolPrefixes.map((p) => `${p}*`),
         'mcp__nanoclaw_host__host_mcp_reply',
       ].join(',');
+      // Denylist every known third-party MCP NOT in this scope. Built-in
+      // tools (Bash/Read/Edit/Write/...) are separately hard-denied below
+      // via `--tools ""`.
+      const disallowedTools = KNOWN_HOST_MCP_PREFIXES.filter(
+        (p) => !scopeDef.allowedToolPrefixes.includes(p),
+      )
+        .map((p) => `${p}*`)
+        .join(',');
 
       // (8a) Per-spawn MCP config (U8). Registers the host-side reply MCP
       //      server with `sourceGroup`, `chatJid`, and `requestId` baked into
@@ -954,11 +993,20 @@ export async function processTaskIpc(
         break;
       }
 
+      // `--tools ""` disables ALL built-in tools (Bash/Read/Edit/Write/...).
+      // The host skill never needs them — it only invokes scope MCPs and the
+      // reply primitive. Verified via `claude --help`: `--tools` accepts ""
+      // to disable everything in the built-in set.
+      // `--disallowed-tools` enumerates third-party MCPs outside the scope,
+      // defending against MCP cross-pollination via prompt injection.
       const argv = [
         '-p',
         '--dangerously-skip-permissions',
+        '--tools',
+        '',
         '--allowed-tools',
         allowedTools,
+        ...(disallowedTools ? ['--disallowed-tools', disallowedTools] : []),
         '--mcp-config',
         mcpConfigPath,
         `/host-mcp-agent ${scope} ${sourceGroup} ${requestId}`,

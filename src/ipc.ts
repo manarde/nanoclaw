@@ -1,4 +1,4 @@
-import { spawn } from 'child_process';
+import { spawn, ChildProcess, SpawnOptions } from 'child_process';
 import fs from 'fs';
 import path from 'path';
 
@@ -7,7 +7,12 @@ import { CronExpressionParser } from 'cron-parser';
 import { DATA_DIR, IPC_POLL_INTERVAL, TIMEZONE } from './config.js';
 import { AvailableGroup } from './container-runner.js';
 import { createTask, deleteTask, getTaskById, updateTask } from './db.js';
-import { isValidGroupFolder, resolveGroupFolderPath } from './group-folder.js';
+import {
+  isValidGroupFolder,
+  isWithinBase,
+  resolveGroupFolderPath,
+  resolveGroupIpcPath,
+} from './group-folder.js';
 import { logger } from './logger.js';
 import { RegisteredGroup, SendFileOpts } from './types.js';
 
@@ -29,6 +34,10 @@ export interface IpcDeps {
     registeredJids: Set<string>,
   ) => void;
   onTasksChanged: () => void;
+  // Spawn seam for host-side `claude -p` processes (host-MCP proxy). Injected
+  // so tests can stub without actually forking claude. Default impl in
+  // `src/index.ts` wraps `child_process.spawn(CLAUDE_BIN, argv, opts)`.
+  spawnHostClaude: (argv: string[], opts: SpawnOptions) => ChildProcess;
 }
 
 // Container mounts the group folder at /workspace/group; translate the agent's
@@ -67,6 +76,158 @@ const PITCHBOOK_DEBOUNCE_MS = 5 * 60 * 1000;
 const pitchbookLastRun = new Map<string, number>();
 const WATCHLIST_SLUG_PATTERN = /^[a-z0-9][a-z0-9-]{0,63}$/;
 const CLAUDE_BIN = process.env.CLAUDE_BIN || 'claude';
+
+// ---- Host-MCP proxy state (U1) --------------------------------------------
+// Generalized host-side MCP query. Container agents dispatch via the
+// `run_host_mcp_query` MCP tool (U2) which writes an IPC task file; the
+// handler below validates, authz-checks, and spawns a scope-constrained
+// `claude -p` session that answers via the `host_mcp_reply` primitive (U8).
+
+// Registry of known scopes. Each scope maps to the MCP tool-name prefixes the
+// spawned claude session is allowed to use (enforced at spawn via
+// --allowed-tools). Extend this with care — every new scope is a new host-side
+// privilege boundary.
+const HOST_MCP_SCOPES: Record<string, { allowedToolPrefixes: string[] }> = {
+  pitchbook: {
+    allowedToolPrefixes: ['mcp__claude_ai_PitchBook_Premium__'],
+  },
+};
+
+// Known third-party MCP prefixes available on this host's user-scope claude
+// config. The host-mcp-agent runs under the daemon's $HOME, so it inherits
+// EVERY MCP the user has configured. The claude CLI's `--allowed-tools` flag
+// behaves as an auto-approve hint rather than a hard allowlist for MCP tools,
+// so a prompt-injected scope query can still reach unrelated MCPs (Gmail send,
+// Drive create, Calendar invite, etc.) and execute on Matt's behalf.
+//
+// Defense in depth (Option C):
+//   1. `--tools ""` hard-denies all built-in tools (Bash/Read/Edit/Write/...).
+//      The host skill only needs MCP tools, so this is safe.
+//   2. `--disallowed-tools` enumerates every known third-party MCP prefix that
+//      is NOT in the current scope's allowlist, blocking cross-pollination.
+//
+// MAINTENANCE: when Matt adds a new user-scope MCP via `claude mcp add ...`,
+// add its prefix here, otherwise the host-mcp-agent will be able to reach it
+// from any scope. Stronger long-term fix: switch to `--strict-mcp-config` and
+// register the scope's MCP server explicitly in our per-spawn `.mcp-config.json`
+// — that eliminates the inherited-config blast radius entirely. See
+// `docs/plans/2026-04-24-001-feat-host-mcp-proxy-plan.md` risk table.
+const KNOWN_HOST_MCP_PREFIXES = [
+  'mcp__claude_ai_PitchBook_Premium__',
+  'mcp__claude_ai_Gmail__',
+  'mcp__claude_ai_Google_Calendar__',
+  'mcp__claude_ai_Google_Cloud_BigQuery__',
+  'mcp__claude_ai_Google_Drive__',
+  'mcp__claude_ai_Clay__',
+  'mcp__claude_ai_PowerNotes__',
+];
+
+const HOST_MCP_DEBOUNCE_MS = 30_000;
+const HOST_MCP_TIMEOUT_MS = 120_000;
+const HOST_MCP_KILL_GRACE_MS = 5_000;
+const HOST_MCP_MAX_QUESTION_LEN = 4000;
+const MAX_CONCURRENT_HOST_MCP = 4;
+const MAX_CHILD_OUTPUT_BYTES = 512 * 1024;
+
+const REQUEST_ID_PATTERN =
+  /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/;
+const SCOPE_NAME_PATTERN = /^[a-z][a-z0-9_-]{0,31}$/;
+
+// The host-side reply MCP server (U8). `dist/host-mcp-reply-server.js` is the
+// normal prod path (daemon runs from `dist/`); dev or test harnesses can
+// override with HOST_MCP_REPLY_SERVER_CMD / HOST_MCP_REPLY_SERVER_SCRIPT.
+const HOST_MCP_REPLY_SERVER_CMD =
+  process.env.HOST_MCP_REPLY_SERVER_CMD || 'node';
+const HOST_MCP_REPLY_SERVER_SCRIPT =
+  process.env.HOST_MCP_REPLY_SERVER_SCRIPT || 'dist/host-mcp-reply-server.js';
+
+// Exported for test access only (U6). Tests need to observe debounce stamping,
+// pre-populate the concurrency map, and reset between cases. Production code
+// paths do not read these exports.
+export const hostMcpLastRun = new Map<string, number>(); // key: `${sourceGroup}:${scope}`
+export const hostMcpActiveChildren = new Map<string, ChildProcess>(); // key: requestId
+
+// Host-only directory for per-spawn `.mcp-config.json` files. NOT bind-mounted
+// into any container (verified in `src/container-runner.ts` — only
+// `host-mcp-requests/` is mounted). The MCP config registers the host-side
+// reply server with `sourceGroup`/`chatJid`/`requestId` baked into argv; if a
+// container could overwrite this file it could inject arbitrary `mcpServers`
+// entries and achieve host code execution. Keeping the config outside the
+// container's filesystem namespace eliminates that race.
+const HOST_MCP_CONFIG_DIR = path.join(DATA_DIR, 'host-mcp-configs');
+
+function ensureHostMcpConfigDir(): void {
+  fs.mkdirSync(HOST_MCP_CONFIG_DIR, { recursive: true });
+  try {
+    fs.chmodSync(HOST_MCP_CONFIG_DIR, 0o700);
+  } catch {
+    /* best-effort — chmod can fail on some filesystems (e.g. CI tmpfs) */
+  }
+}
+
+// Test-only helper: clears module-scope host-MCP state so each test starts
+// from a clean slate. Safe to call from production code paths but intended
+// only for `beforeEach` in unit tests.
+export function _resetHostMcpState(): void {
+  hostMcpLastRun.clear();
+  hostMcpActiveChildren.clear();
+}
+
+// Returns true if the group is trusted to invoke the given action name.
+// Main groups bypass the trustedHostActions list (they're trusted by default).
+// Used by `pitchbook_check` (flat action name) and `host_mcp_query:<scope>`
+// (namespaced action name). Exported for unit-test coverage of the authz
+// matrix (U6 T16); consumers in this file reference it directly.
+export function hasTrustedHostAction(
+  reg: RegisteredGroup | undefined,
+  action: string,
+): boolean {
+  return reg?.containerConfig?.trustedHostActions?.includes(action) === true;
+}
+
+// Synthesize a plain-text failure reply the user will see in chat. Writes a
+// `type: "message"` IPC file atomically (tmp → rename) into the source
+// group's messages dir; the IPC watcher picks it up on the next tick and
+// routes through the normal send path. Swallows write errors after logging —
+// failure-to-notify must not crash the watcher.
+function synthesizeFailureReply(
+  sourceGroup: string,
+  chatJid: string,
+  text: string,
+): void {
+  try {
+    if (!isValidGroupFolder(sourceGroup) || !chatJid || !text) return;
+    const messagesDir = path.join(resolveGroupIpcPath(sourceGroup), 'messages');
+    fs.mkdirSync(messagesDir, { recursive: true });
+    const filename = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}.json`;
+    const filePath = path.join(messagesDir, filename);
+    const tempPath = `${filePath}.tmp`;
+    const payload = {
+      type: 'message',
+      chatJid,
+      text,
+      groupFolder: sourceGroup,
+      timestamp: new Date().toISOString(),
+    };
+    fs.writeFileSync(tempPath, JSON.stringify(payload, null, 2));
+    fs.renameSync(tempPath, filePath);
+  } catch (err) {
+    logger.error(
+      { err, sourceGroup, chatJid },
+      'Failed to synthesize failure reply',
+    );
+  }
+}
+
+// Atomic write (tmp → rename) for the host-MCP request descriptor. Mirrors
+// the container-side `writeIpcFile` pattern at
+// `container/agent-runner/src/ipc-mcp-stdio.ts:23-35`.
+function writeHostMcpRequestFile(filePath: string, data: object): void {
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+  const tempPath = `${filePath}.tmp`;
+  fs.writeFileSync(tempPath, JSON.stringify(data, null, 2));
+  fs.renameSync(tempPath, filePath);
+}
 
 function pitchbookWatchlistExists(slug: string): boolean {
   if (slug === 'all') return true;
@@ -273,6 +434,10 @@ export async function processTaskIpc(
     containerConfig?: RegisteredGroup['containerConfig'];
     // For pitchbook_check
     watchlist?: string;
+    // For host_mcp_query
+    scope?: string;
+    question?: string;
+    requestId?: string;
   },
   sourceGroup: string, // Verified identity from IPC directory
   isMain: boolean, // Verified from directory path
@@ -566,11 +731,7 @@ export async function processTaskIpc(
       const sourceReg = Object.values(registeredGroups).find(
         (g) => g.folder === sourceGroup,
       );
-      const trustedForThisAction =
-        sourceReg?.containerConfig?.trustedHostActions?.includes(
-          'pitchbook_check',
-        ) === true;
-      if (!isMain && !trustedForThisAction) {
+      if (!isMain && !hasTrustedHostAction(sourceReg, 'pitchbook_check')) {
         logger.warn(
           { sourceGroup },
           'Unauthorized pitchbook_check attempt blocked',
@@ -649,6 +810,365 @@ export async function processTaskIpc(
           { slug, err },
           'Failed to spawn claude for pitchbook-alerts',
         );
+      });
+      break;
+    }
+
+    case 'host_mcp_query': {
+      // Generalized host-MCP proxy. Container agents call
+      // `run_host_mcp_query(scope, question)` (U2) which writes a task file
+      // that lands here. The handler validates every untrusted field, gates
+      // on authz / concurrency / debounce, then spawns a scope-constrained
+      // `claude -p` session. The spawned session uses the `host_mcp_reply`
+      // MCP tool (U8) to deliver its answer; this handler ONLY narrates
+      // failures — never synthesizes a success reply.
+      const scope = data.scope ?? '';
+      const question = data.question ?? '';
+      const requestId = data.requestId ?? '';
+      const chatJid = data.chatJid ?? '';
+
+      const reject = (msg: string): void => {
+        synthesizeFailureReply(sourceGroup, chatJid, msg);
+        logger.warn(
+          { requestId, scope, sourceGroup },
+          `host_mcp_query rejected: ${msg}`,
+        );
+      };
+
+      // (1) Shape-validate all untrusted fields before touching the filesystem
+      //     or spawning anything. Fast-fail on any shape violation.
+      if (
+        !SCOPE_NAME_PATTERN.test(scope) ||
+        !REQUEST_ID_PATTERN.test(requestId) ||
+        !isValidGroupFolder(sourceGroup) ||
+        typeof question !== 'string' ||
+        question.length === 0 ||
+        question.length > HOST_MCP_MAX_QUESTION_LEN ||
+        typeof chatJid !== 'string' ||
+        chatJid.length === 0
+      ) {
+        reject('Invalid request format.');
+        break;
+      }
+
+      // (2) Registry own-property check (prototype-pollution-safe).
+      if (!Object.prototype.hasOwnProperty.call(HOST_MCP_SCOPES, scope)) {
+        reject(`Unknown scope: ${scope}.`);
+        break;
+      }
+
+      // (3) Authz: main groups bypass; non-main must have the namespaced
+      //     `host_mcp_query:<scope>` action in trustedHostActions.
+      const sourceReg = Object.values(registeredGroups).find(
+        (g) => g.folder === sourceGroup,
+      );
+      if (
+        !isMain &&
+        !hasTrustedHostAction(sourceReg, `host_mcp_query:${scope}`)
+      ) {
+        reject('Not authorized to call this scope.');
+        break;
+      }
+
+      // (4) Concurrency cap.
+      if (hostMcpActiveChildren.size >= MAX_CONCURRENT_HOST_MCP) {
+        reject('Host-MCP proxy is busy; try again shortly.');
+        break;
+      }
+
+      // (5) Debounce gate (check only — stamp AFTER spawn success so failed
+      //     spawns don't consume the user's debounce budget).
+      const debounceKey = `${sourceGroup}:${scope}`;
+      const now = Date.now();
+      const last = hostMcpLastRun.get(debounceKey) ?? 0;
+      if (now - last < HOST_MCP_DEBOUNCE_MS) {
+        reject("You're asking too fast — try again in a few seconds.");
+        break;
+      }
+
+      // (6) Safe path construction. REQUEST_ID_PATTERN already restricts to
+      //     UUID-v4 shape, so this is defense-in-depth.
+      const hostMcpBase = path.join(
+        resolveGroupIpcPath(sourceGroup),
+        'host-mcp-requests',
+      );
+      const requestPath = path.join(hostMcpBase, `${requestId}.json`);
+      if (!isWithinBase(hostMcpBase, requestPath)) {
+        reject('Invalid request identifier.');
+        break;
+      }
+
+      // (7) Write the request descriptor atomically; the host-mcp-agent skill
+      //     (U4) reads it by path.
+      try {
+        writeHostMcpRequestFile(requestPath, {
+          question,
+          chatJid,
+          sourceGroup,
+          scope,
+        });
+      } catch (err) {
+        logger.error(
+          { err, requestId, scope, sourceGroup },
+          'host_mcp_query: failed to write request file',
+        );
+        reject('Could not stage host-MCP request.');
+        break;
+      }
+
+      // (8) Spawn the host-side claude with a locked-down tool allowlist
+      //     plus an explicit denylist for every other known host MCP. See
+      //     KNOWN_HOST_MCP_PREFIXES for the rationale (Option C: partial
+      //     sandbox + explicit MCP denylist). The scope's allowed prefixes
+      //     are suffixed with `*` so they match any tool in that MCP server;
+      //     the reply primitive (U8) is the only write path the agent has.
+      const scopeDef = HOST_MCP_SCOPES[scope];
+      const allowedTools = [
+        ...scopeDef.allowedToolPrefixes.map((p) => `${p}*`),
+        'mcp__nanoclaw_host__host_mcp_reply',
+      ].join(',');
+      // Denylist every known third-party MCP NOT in this scope. Built-in
+      // tools (Bash/Read/Edit/Write/...) are separately hard-denied below
+      // via `--tools ""`.
+      const disallowedTools = KNOWN_HOST_MCP_PREFIXES.filter(
+        (p) => !scopeDef.allowedToolPrefixes.includes(p),
+      )
+        .map((p) => `${p}*`)
+        .join(',');
+
+      // (8a) Per-spawn MCP config (U8). Registers the host-side reply MCP
+      //      server with `sourceGroup`, `chatJid`, and `requestId` baked into
+      //      its positional argv — the agent cannot override these since
+      //      they're argv to the server, not tool parameters. File is
+      //      unlinked alongside the request descriptor on child exit.
+      //
+      //      SECURITY: this config lives in `data/host-mcp-configs/` which is
+      //      NOT bind-mounted into any container (see `src/container-runner.ts`).
+      //      A prompt-injected container CANNOT race-overwrite this file to
+      //      inject malicious `mcpServers` entries — the path is outside the
+      //      container's filesystem namespace. The request descriptor
+      //      (`<id>.json`) stays inside `host-mcp-requests/` because the host
+      //      skill reads it from there; only the authority-bearing config is
+      //      moved.
+      ensureHostMcpConfigDir();
+      const mcpConfigPath = path.join(
+        HOST_MCP_CONFIG_DIR,
+        `${requestId}.mcp-config.json`,
+      );
+      if (!isWithinBase(HOST_MCP_CONFIG_DIR, mcpConfigPath)) {
+        try {
+          fs.unlinkSync(requestPath);
+        } catch {
+          /* ENOENT ok */
+        }
+        reject('Invalid request identifier.');
+        break;
+      }
+      const mcpConfig = {
+        mcpServers: {
+          nanoclaw_host: {
+            command: HOST_MCP_REPLY_SERVER_CMD,
+            args: [
+              HOST_MCP_REPLY_SERVER_SCRIPT,
+              sourceGroup,
+              chatJid,
+              requestId,
+            ],
+          },
+        },
+      };
+      try {
+        writeHostMcpRequestFile(mcpConfigPath, mcpConfig);
+      } catch (err) {
+        try {
+          fs.unlinkSync(requestPath);
+        } catch {
+          /* ENOENT ok */
+        }
+        logger.error(
+          { err, requestId, scope, sourceGroup },
+          'host_mcp_query: failed to write MCP config file',
+        );
+        reject('Could not stage host-MCP request.');
+        break;
+      }
+
+      // `--tools ""` disables ALL built-in tools (Bash/Read/Edit/Write/...).
+      // The host skill never needs them — it only invokes scope MCPs and the
+      // reply primitive. Verified via `claude --help`: `--tools` accepts ""
+      // to disable everything in the built-in set.
+      // `--disallowed-tools` enumerates third-party MCPs outside the scope,
+      // defending against MCP cross-pollination via prompt injection.
+      const argv = [
+        '-p',
+        '--dangerously-skip-permissions',
+        '--tools',
+        '',
+        '--allowed-tools',
+        allowedTools,
+        ...(disallowedTools ? ['--disallowed-tools', disallowedTools] : []),
+        '--mcp-config',
+        mcpConfigPath,
+        `/host-mcp-agent ${scope} ${sourceGroup} ${requestId}`,
+      ];
+
+      logger.info(
+        { requestId, scope, sourceGroup },
+        'Spawning host-mcp-agent via claude CLI',
+      );
+
+      let child: ChildProcess;
+      try {
+        child = deps.spawnHostClaude(argv, {
+          cwd: process.cwd(),
+          stdio: ['ignore', 'pipe', 'pipe'],
+        });
+      } catch (err) {
+        // Synchronous spawn failure (e.g., CLAUDE_BIN missing).
+        try {
+          fs.unlinkSync(requestPath);
+        } catch {
+          /* ENOENT ok */
+        }
+        try {
+          fs.unlinkSync(mcpConfigPath);
+        } catch {
+          /* ENOENT ok */
+        }
+        logger.error(
+          { err, requestId, scope, sourceGroup },
+          'host_mcp_query: spawn threw synchronously',
+        );
+        reject('Could not start host-MCP query.');
+        break;
+      }
+
+      // (9) Stamp debounce SYNCHRONOUSLY now that spawn has returned without
+      //     throwing. The IPC watcher serializes task processing, but each
+      //     handler returns before any 'spawn' event fires — stamping in the
+      //     async event handler would let bursts up to the concurrency cap
+      //     ALL bypass debounce. The 'error' path below rolls this back.
+      hostMcpLastRun.set(debounceKey, Date.now());
+
+      // (10) Track the child for concurrency accounting and timeout cleanup.
+      hostMcpActiveChildren.set(requestId, child);
+
+      // (11) Bounded output buffering. After the cap, set a `truncated` flag
+      //      and drop further chunks — prevents a runaway child from
+      //      exhausting host memory via stdout/stderr.
+      const buf = { stdout: '', stderr: '', truncated: false };
+      const append =
+        (stream: 'stdout' | 'stderr') =>
+        (chunk: Buffer): void => {
+          const s = chunk.toString();
+          if (buf[stream].length + s.length > MAX_CHILD_OUTPUT_BYTES) {
+            buf.truncated = true;
+            return;
+          }
+          buf[stream] += s;
+        };
+      child.stdout?.on('data', append('stdout'));
+      child.stderr?.on('data', append('stderr'));
+
+      // (12) Two-step timeout: SIGTERM first, then SIGKILL after a grace
+      //      window. The soft timer also synthesizes the timeout reply so
+      //      the user sees a message even if the child exits cleanly after.
+      //      Declared before the 'error' listener so its cleanup branch can
+      //      reference them; `cleanedUp` makes cleanup idempotent across the
+      //      'error' / 'exit' race (per Node semantics, 'exit' may or may
+      //      not fire after 'error').
+      let cleanedUp = false;
+      let killTimer: NodeJS.Timeout | undefined;
+      const softTimer: NodeJS.Timeout = setTimeout(() => {
+        synthesizeFailureReply(
+          sourceGroup,
+          chatJid,
+          `${scope} query timed out after ${HOST_MCP_TIMEOUT_MS / 1000}s.`,
+        );
+        try {
+          child.kill('SIGTERM');
+        } catch (err) {
+          logger.warn({ err, requestId }, 'host_mcp_query: SIGTERM failed');
+        }
+        killTimer = setTimeout(() => {
+          try {
+            child.kill('SIGKILL');
+          } catch (err) {
+            logger.warn({ err, requestId }, 'host_mcp_query: SIGKILL failed');
+          }
+        }, HOST_MCP_KILL_GRACE_MS);
+      }, HOST_MCP_TIMEOUT_MS);
+
+      const performCleanup = (): void => {
+        if (cleanedUp) return;
+        cleanedUp = true;
+        clearTimeout(softTimer);
+        if (killTimer) clearTimeout(killTimer);
+        hostMcpActiveChildren.delete(requestId);
+        try {
+          fs.unlinkSync(requestPath);
+        } catch {
+          /* ENOENT ok — already gone */
+        }
+        try {
+          fs.unlinkSync(mcpConfigPath);
+        } catch {
+          /* ENOENT ok — already gone */
+        }
+      };
+
+      // (13) Async spawn failure (e.g. ENOENT after fork). Per Node semantics
+      //      'exit' may not fire after 'error', so this handler must perform
+      //      full cleanup itself: clear timers, drop the map entry, unlink
+      //      both files, and roll back the debounce stamp so the failed
+      //      spawn doesn't consume the user's debounce budget. `cleanedUp`
+      //      guards against the race where 'exit' fires later anyway.
+      child.on('error', (err) => {
+        if (cleanedUp) {
+          logger.warn(
+            { err, requestId },
+            'host_mcp_query: error after cleanup (ignored)',
+          );
+          return;
+        }
+        hostMcpLastRun.delete(debounceKey);
+        performCleanup();
+        logger.error(
+          { err, requestId, scope, sourceGroup },
+          'host_mcp_query: spawn failure',
+        );
+        synthesizeFailureReply(
+          sourceGroup,
+          chatJid,
+          'Could not start host-MCP query.',
+        );
+      });
+
+      // (14) Exit cleanup. try/finally ensures the map entry and request
+      //      file are cleaned up even if logger throws. Do NOT synthesize
+      //      a success reply — that's the host_mcp_reply tool's job (U8).
+      //      `performCleanup` is idempotent against the 'error'-then-'exit'
+      //      race.
+      const spawnedAt = Date.now();
+      child.on('exit', (code, signal) => {
+        try {
+          logger.info(
+            {
+              requestId,
+              scope,
+              sourceGroup,
+              code,
+              signal,
+              stdoutLen: buf.stdout.length,
+              stderrLen: buf.stderr.length,
+              truncated: buf.truncated,
+              durationMs: Date.now() - spawnedAt,
+            },
+            'host_mcp_query exit',
+          );
+        } finally {
+          performCleanup();
+        }
       });
       break;
     }

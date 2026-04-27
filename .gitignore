@@ -35,5 +35,9 @@ groups/global/*
 # Skills system (local per-installation state)
 .nanoclaw/
 
+# Claude Code session-local cron state (CronCreate)
+.claude/scheduled_tasks.json
+.claude/scheduled_tasks.lock
+
 agents-sdk-docs
 .worktrees

@@ -113,6 +113,24 @@ Instructions here...
 - Put code in separate files, not inline in the markdown
 - See the [skills standard](https://code.claude.com/docs/en/skills) for all available frontmatter fields
 
+## Adding a new host-MCP scope
+
+The host-MCP proxy lets container agents dispatch scope-constrained queries to host-side MCPs (e.g. PitchBook, and eventually others) and get sandboxed replies back. Adding a new scope touches **code, container skill, sandbox policy, and per-group DB state** — missing any one of those breaks the path silently. Checklist:
+
+1. **Source — `src/ipc.ts`:**
+   - Append a new entry to `HOST_MCP_SCOPES` with the MCP's tool prefix, e.g. `gmail: { allowedToolPrefixes: ['mcp__claude_ai_Gmail__'] }`.
+   - If the new scope's MCP is not already in `KNOWN_HOST_MCP_PREFIXES`, **add it there too** — otherwise the denylist won't include it for OTHER scopes that should not have access (the constant is the canonical "every host MCP we know about").
+
+2. **Container skill — `container/skills/<scope>/SKILL.md`:**
+   - The agent-side skill that decides when to dispatch via `run_host_mcp_query(scope, question)`. Mirror the `pitchbook` skill's tool-map table so the container agent knows which MCP tool to ask for.
+
+3. **Per-group authorization — `store/messages.db`:**
+   - Main groups bypass authz; non-main groups need the namespaced action `host_mcp_query:<scope>` added to their `container_config.trustedHostActions` JSON array. SQL update + daemon kickstart restart, since the daemon caches groups in memory at startup. (Yes, both the source and the data — there's no auto-sync.)
+
+4. **Daemon restart:** `launchctl kickstart -k gui/$(id -u)/com.nanoclaw` to pick up the new `HOST_MCP_SCOPES` and re-read group state from DB.
+
+5. **Smoke test:** trigger a real query from a permitted chat. Watch `logs/nanoclaw.log` for `Spawning host-mcp-agent via claude CLI` followed by `host_mcp_query exit` with `code: 0`. Unit tests in `src/ipc-auth.test.ts` cover authz/validation/debounce/timeout but cannot exercise the host claude spawn end-to-end — see [docs/solutions/host-mcp-proxy-lessons.md](docs/solutions/host-mcp-proxy-lessons.md) for the bugs that only surface under real invocation.
+
 ## Testing
 
 Test your contribution on a fresh clone before submitting. For skills, run the skill end-to-end and verify it works.

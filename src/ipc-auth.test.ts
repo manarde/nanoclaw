@@ -842,6 +842,11 @@ describe('host_mcp_query authorization', () => {
     expect(slashArg).toBe(
       `/host-mcp-agent pitchbook ${MAIN_FOLDER} ${VALID_REQUEST_ID}`,
     );
+    // `--` MUST immediately precede the prompt, otherwise the variadic
+    // `--mcp-config` (or any other variadic flag preceding the prompt) eats
+    // the prompt as one of its values. Latent bug from U8; caught the first
+    // time host-mcp was exercised end-to-end.
+    expect(argv[argv.length - 2]).toBe('--');
     expect(opts).toMatchObject({ stdio: ['ignore', 'pipe', 'pipe'] });
 
     // Request descriptor file written at the expected path

@@ -999,6 +999,13 @@ export async function processTaskIpc(
       // to disable everything in the built-in set.
       // `--disallowed-tools` enumerates third-party MCPs outside the scope,
       // defending against MCP cross-pollination via prompt injection.
+      //
+      // The `--` separator is REQUIRED. Several claude CLI flags
+      // (`--allowed-tools`, `--disallowed-tools`, `--mcp-config`, `--tools`)
+      // are variadic in commander.js — without `--`, the variadic flag right
+      // before the prompt swallows the prompt as another value. Reproduced
+      // with `claude -p --mcp-config /tmp/x.json "say hello"` → error
+      // "MCP config file not found: <cwd>/say hello".
       const argv = [
         '-p',
         '--dangerously-skip-permissions',
@@ -1009,6 +1016,7 @@ export async function processTaskIpc(
         ...(disallowedTools ? ['--disallowed-tools', disallowedTools] : []),
         '--mcp-config',
         mcpConfigPath,
+        '--',
         `/host-mcp-agent ${scope} ${sourceGroup} ${requestId}`,
       ];
 

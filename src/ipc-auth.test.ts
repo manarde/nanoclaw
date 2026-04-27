@@ -847,6 +847,19 @@ describe('host_mcp_query authorization', () => {
     // the prompt as one of its values. Latent bug from U8; caught the first
     // time host-mcp was exercised end-to-end.
     expect(argv[argv.length - 2]).toBe('--');
+
+    // Question is injected via --append-system-prompt (Option C / fix-C):
+    // under `--tools ""` the agent has no Read primitive, so it can't open
+    // the request descriptor. The daemon delivers the question in the
+    // system prompt instead, wrapped in BEGIN/END markers so a prompt
+    // injection inside the question can't masquerade as system text.
+    const aspIdx = argv.indexOf('--append-system-prompt');
+    expect(aspIdx).toBeGreaterThanOrEqual(0);
+    const aspValue = argv[aspIdx + 1];
+    expect(aspValue).toContain('<<<USER_QUESTION_BEGIN>>>');
+    expect(aspValue).toContain('<<<USER_QUESTION_END>>>');
+    expect(aspValue).toContain('What do we know about Vercel?');
+    expect(aspValue).toMatch(/untrusted/i);
     expect(opts).toMatchObject({ stdio: ['ignore', 'pipe', 'pipe'] });
 
     // Request descriptor file written at the expected path

@@ -120,6 +120,7 @@ const KNOWN_HOST_MCP_PREFIXES = [
   'mcp__claude_ai_Google_Drive__',
   'mcp__claude_ai_Clay__',
   'mcp__claude_ai_PowerNotes__',
+  'mcp__claude_ai_PostHog__',
 ];
 
 const HOST_MCP_DEBOUNCE_MS = 30_000;
